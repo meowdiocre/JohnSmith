@@ -7,8 +7,8 @@ IntelDescriptorBase(
     )
 {
     ULONG64 base = ((Descriptor >> 16) & 0xffffull) |
-                   ((Descriptor >> 32) & 0xff0000ull) |
-                   ((Descriptor >> 56) & 0xff000000ull);
+                   (((Descriptor >> 32) & 0xffull) << 16) |
+                   (((Descriptor >> 56) & 0xffull) << 24);
     if (HighBase != NULL) {
         base |= (ULONG64)(*HighBase) << 32;
     }
@@ -112,6 +112,10 @@ IntelSetupVmcs(
     ULONG desiredPrimary;
     ULONG requiredExit;
     ULONG requiredEntry;
+    ULONG64 cr0Fixed0;
+    ULONG64 cr0Fixed1;
+    ULONG64 cr4Fixed0;
+    ULONG64 cr4Fixed1;
     ULONG64 hostRsp;
     ULONG64 eptp;
     int cpuid[4];
@@ -192,16 +196,35 @@ IntelSetupVmcs(
                     VMX_ENTRY_LOAD_PAT | VMX_ENTRY_LOAD_EFER;
     exitControls = IntelAdjustControls(requiredExit, exitMsr);
     entryControls = IntelAdjustControls(requiredEntry, entryMsr);
-    if (pinControls != 0 ||
-        (primaryControls & ~desiredPrimary) != 0 ||
-        (secondaryControls & ~desiredSecondary) != 0 ||
-        (primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0 ||
-        (primaryControls & (VMX_PRIMARY_USE_IO_BITMAPS |
+    context->PinControls = pinControls;
+    context->PrimaryControls = primaryControls;
+    context->SecondaryControls = secondaryControls;
+    context->ExitControls = exitControls;
+    context->EntryControls = entryControls;
+    context->DesiredPrimaryControls = desiredPrimary;
+    context->DesiredSecondaryControls = desiredSecondary;
+    context->RequiredSecondaryControls = requiredSecondary;
+    context->RequiredExitControls = requiredExit;
+    context->RequiredEntryControls = requiredEntry;
+    context->ControlFailureMask = 0;
+    if ((primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION;
+    }
+    if ((primaryControls & (VMX_PRIMARY_USE_IO_BITMAPS |
                             VMX_PRIMARY_USE_MSR_BITMAPS)) !=
-            (VMX_PRIMARY_USE_IO_BITMAPS | VMX_PRIMARY_USE_MSR_BITMAPS) ||
-        (secondaryControls & requiredSecondary) != requiredSecondary ||
-        (exitControls & requiredExit) != requiredExit ||
-        (entryControls & requiredEntry) != requiredEntry) {
+        (VMX_PRIMARY_USE_IO_BITMAPS | VMX_PRIMARY_USE_MSR_BITMAPS)) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_BITMAPS;
+    }
+    if ((secondaryControls & requiredSecondary) != requiredSecondary) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_SECONDARY_REQUIRED;
+    }
+    if ((exitControls & requiredExit) != requiredExit) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_EXIT_REQUIRED;
+    }
+    if ((entryControls & requiredEntry) != requiredEntry) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_ENTRY_REQUIRED;
+    }
+    if (context->ControlFailureMask != 0) {
         return STATUS_HV_FEATURE_UNAVAILABLE;
     }
 
@@ -210,6 +233,10 @@ IntelSetupVmcs(
     context->EptPointer = eptp;
     context->Vpid = (secondaryControls & VMX_SECONDARY_ENABLE_VPID) != 0
         ? (USHORT)(Cpu->ProcessorIndex + 1) : 0;
+    cr0Fixed0 = __readmsr(IA32_VMX_CR0_FIXED0);
+    cr0Fixed1 = __readmsr(IA32_VMX_CR0_FIXED1);
+    cr4Fixed0 = __readmsr(IA32_VMX_CR4_FIXED0);
+    cr4Fixed1 = __readmsr(IA32_VMX_CR4_FIXED1);
     hostRsp = ((ULONG64)context->HostStack + INTEL_HOST_STACK_SIZE - 64) &
               ~0xfull;
     *(HV_CPU**)hostRsp = Cpu;
@@ -291,11 +318,13 @@ IntelSetupVmcs(
     VMX_WRITE(VMCS_GUEST_SYSENTER_CS, __readmsr(IA32_SYSENTER_CS));
     VMX_WRITE(VMCS_GUEST_SYSENTER_ESP, __readmsr(IA32_SYSENTER_ESP));
     VMX_WRITE(VMCS_GUEST_SYSENTER_EIP, __readmsr(IA32_SYSENTER_EIP));
-    VMX_WRITE(VMCS_CR0_GUEST_HOST_MASK,
-        __readmsr(IA32_VMX_CR0_FIXED0) ^ __readmsr(IA32_VMX_CR0_FIXED1));
+    /*
+     * A mask bit set to 1 is host-owned.  Own only values that VMX forces
+     * to one or zero, plus VMXE which must remain hidden from the guest.
+     */
+    VMX_WRITE(VMCS_CR0_GUEST_HOST_MASK, cr0Fixed0 | ~cr0Fixed1);
     VMX_WRITE(VMCS_CR4_GUEST_HOST_MASK,
-        (__readmsr(IA32_VMX_CR4_FIXED0) ^
-         __readmsr(IA32_VMX_CR4_FIXED1)) | VMX_CR4_VMXE);
+        cr4Fixed0 | ~cr4Fixed1 | VMX_CR4_VMXE);
     VMX_WRITE(VMCS_CR0_READ_SHADOW, context->OriginalCr0);
     VMX_WRITE(VMCS_CR4_READ_SHADOW, context->OriginalCr4);
 

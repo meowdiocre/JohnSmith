@@ -30,53 +30,227 @@ IntelVmReadValue(
     return TRUE;
 }
 
+static NTSTATUS
+IntelGetAdvancedGuestRip(
+    _In_ const INTEL_CPU_CONTEXT* Context,
+    _In_ ULONG64 GuestRip,
+    _In_ ULONG InstructionLength,
+    _Out_ PULONG64 AdvancedGuestRip
+    )
+{
+    ULONG64 csAccessRights;
+    ULONG64 nextRip;
+
+    if (!IntelVmReadValue(VMCS_GUEST_CS_AR, &csAccessRights)) {
+        return STATUS_HV_INVALID_VP_STATE;
+    }
+
+    nextRip = GuestRip + InstructionLength;
+    if ((Context->EntryControls & VMX_ENTRY_IA32E_MODE) == 0 ||
+        (csAccessRights & (1ull << 13)) == 0) {
+        /* Outside 64-bit code, architectural RIP is the zero-extended EIP. */
+        nextRip = (ULONG)nextRip;
+    }
+    *AdvancedGuestRip = nextRip;
+    return STATUS_SUCCESS;
+}
+
+static VOID
+IntelAdvanceGuestRip(
+    _In_ const INTEL_CPU_CONTEXT* Context,
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG Reason,
+    _In_ ULONG64 GuestRip,
+    _In_ ULONG InstructionLength
+    )
+{
+    ULONG64 nextRip;
+    NTSTATUS status;
+
+    status = IntelGetAdvancedGuestRip(
+        Context, GuestRip, InstructionLength, &nextRip);
+    if (NT_SUCCESS(status)) {
+        status = IntelVmWrite(VMCS_GUEST_RIP, nextRip);
+    }
+    if (!NT_SUCCESS(status)) {
+        KeBugCheckEx(
+            HYPERVISOR_ERROR,
+            INTEL_BUGCHECK_UNEXPECTED_EXIT,
+            Cpu->ProcessorIndex,
+            ((ULONG64)Reason << 32) | 10,
+            GuestRip);
+    }
+}
+
+static NTSTATUS
+IntelRestoreVectoringEvent(
+    _In_ ULONG ExitInstructionLength,
+    _Out_ PULONG PendingInformation
+    )
+{
+    ULONG64 information;
+    ULONG type;
+    NTSTATUS status;
+
+    *PendingInformation = 0;
+    status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, 0);
+    if (!NT_SUCCESS(status)) return status;
+    status = IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, 0);
+    if (!NT_SUCCESS(status)) return status;
+    status = IntelVmWrite(VMCS_ENTRY_INSTRUCTION_LENGTH, 0);
+    if (!NT_SUCCESS(status)) return status;
+
+    if (!IntelVmReadValue(VMCS_IDT_VECTORING_INFO, &information)) {
+        return STATUS_HV_INVALID_VP_STATE;
+    }
+    if ((information & (1ull << 31)) == 0) {
+        return STATUS_SUCCESS;
+    }
+    type = (ULONG)((information >> 8) & 7);
+    information &= VMX_EVENT_INFORMATION_MASK;
+    status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, information);
+    if (!NT_SUCCESS(status)) return status;
+    if ((information & (1ull << 11)) != 0) {
+        ULONG64 errorCode;
+        if (!IntelVmReadValue(VMCS_IDT_VECTORING_ERROR, &errorCode)) {
+            return STATUS_HV_INVALID_VP_STATE;
+        }
+        status = IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, errorCode);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    if (type == 4 || type == 5 || type == 6) {
+        status = IntelVmWrite(
+            VMCS_ENTRY_INSTRUCTION_LENGTH, ExitInstructionLength);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    *PendingInformation = (ULONG)information;
+    return STATUS_SUCCESS;
+}
+
+DECLSPEC_NORETURN
+static VOID
+IntelFailEventCollision(
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG Reason,
+    _In_ ULONG PendingInformation,
+    _In_ ULONG NewInformation,
+    _In_ ULONG64 GuestRip
+    )
+{
+    ULONG64 location = ((ULONG64)Cpu->ProcessorIndex << 32) | Reason;
+    ULONG64 events = ((ULONG64)PendingInformation << 32) | NewInformation;
+
+    KeBugCheckEx(
+        HYPERVISOR_ERROR,
+        INTEL_BUGCHECK_EVENT_COLLISION,
+        location,
+        events,
+        GuestRip);
+}
+
 static VOID
 IntelInjectException(
     _In_ ULONG Information,
-    _In_ ULONG ErrorCode
+    _In_ ULONG ErrorCode,
+    _In_ ULONG PendingInformation,
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG Reason,
+    _In_ ULONG64 GuestRip
     )
 {
+    NTSTATUS status;
+
     Information &= VMX_EVENT_INFORMATION_MASK;
-    (VOID)IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, Information);
-    if ((Information & (1u << 11)) != 0) {
-        (VOID)IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, ErrorCode);
+    if ((PendingInformation & (1u << 31)) != 0) {
+        IntelFailEventCollision(
+            Cpu, Reason, PendingInformation, Information, GuestRip);
+    }
+
+    status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, Information);
+    if (NT_SUCCESS(status) && (Information & (1u << 11)) != 0) {
+        status = IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, ErrorCode);
+    }
+    if (!NT_SUCCESS(status)) {
+        KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
+            Cpu->ProcessorIndex, 8, GuestRip);
     }
 }
 
 static VOID
 IntelInjectInvalidOpcode(
-    VOID
+    _In_ ULONG PendingInformation,
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG Reason,
+    _In_ ULONG64 GuestRip
     )
 {
-    IntelInjectException(VMX_ENTRY_INJECT_UD, 0);
+    IntelInjectException(
+        VMX_ENTRY_INJECT_UD,
+        0,
+        PendingInformation,
+        Cpu,
+        Reason,
+        GuestRip);
+}
+
+static ULONG64
+IntelReadDiagnosticValue(
+    _In_ ULONG Field
+    )
+{
+    ULONG64 value;
+
+    return IntelVmReadValue(Field, &value) ? value : MAXULONGLONG;
 }
 
 static VOID
-IntelPreserveVectoringEvent(
-    _In_ ULONG ExitInstructionLength
+IntelRecordExit(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ ULONG RawReason,
+    _In_ ULONG Reason,
+    _In_ ULONG InstructionLength,
+    _In_ ULONG64 GuestRip
     )
 {
-    ULONG64 information;
-    ULONG type;
+    ULONG64 sequence = (ULONG64)InterlockedIncrement64(
+        &Context->ExitSequence);
+    INTEL_EXIT_RECORD* record = &Context->ExitHistory[
+        sequence & (INTEL_EXIT_HISTORY_COUNT - 1)];
 
-    (VOID)IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, 0);
-    if (!IntelVmReadValue(VMCS_IDT_VECTORING_INFO, &information) ||
-        (information & (1ull << 31)) == 0) {
-        return;
-    }
-    type = (ULONG)((information >> 8) & 7);
-    information &= VMX_EVENT_INFORMATION_MASK;
-    (VOID)IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, information);
-    if ((information & (1ull << 11)) != 0) {
-        ULONG64 errorCode;
-        if (IntelVmReadValue(VMCS_IDT_VECTORING_ERROR, &errorCode)) {
-            (VOID)IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, errorCode);
-        }
-    }
-    if (type == 4 || type == 5 || type == 6) {
-        (VOID)IntelVmWrite(
-            VMCS_ENTRY_INSTRUCTION_LENGTH, ExitInstructionLength);
-    }
+    record->Sequence = 0;
+    record->GuestRip = GuestRip;
+    record->ExitQualification =
+        IntelReadDiagnosticValue(VMCS_EXIT_QUALIFICATION);
+    record->GuestLinearAddress =
+        IntelReadDiagnosticValue(VMCS_GUEST_LINEAR_ADDRESS);
+    record->GuestPhysicalAddress =
+        IntelReadDiagnosticValue(VMCS_GUEST_PHYSICAL_ADDRESS);
+    record->Reason = Reason;
+    record->InstructionLength = InstructionLength;
+    record->ExitInterruptionInformation = (ULONG)
+        IntelReadDiagnosticValue(VMCS_EXIT_INTERRUPTION_INFO);
+    record->IdtVectoringInformation = (ULONG)
+        IntelReadDiagnosticValue(VMCS_IDT_VECTORING_INFO);
+    record->EntryInterruptionInformation = (ULONG)
+        IntelReadDiagnosticValue(VMCS_ENTRY_INTERRUPTION_INFO);
+    record->RawReason = RawReason;
+    KeMemoryBarrier();
+    record->Sequence = sequence;
+}
+
+static ULONG
+IntelCompleteVmExit(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ INTEL_VMEXIT_ACTION Action
+    )
+{
+    LONG64 sequence = InterlockedCompareExchange64(
+        &Context->ExitSequence, 0, 0);
+
+    Context->LastExitCompletionTsc = __rdtsc();
+    KeMemoryBarrier();
+    InterlockedExchange64(&Context->CompletedExitSequence, sequence);
+    return (ULONG)Action;
 }
 
 static ULONG64
@@ -291,9 +465,12 @@ IntelVmExitHandler(
 {
     INTEL_CPU_CONTEXT* context;
     SIZE_T value;
+    ULONG rawReason;
     ULONG reason;
     ULONG instructionLength;
+    ULONG pendingInformation;
     ULONG64 guestRip;
+    NTSTATUS status;
     int cpuid[4];
 
     if (Registers == NULL || Cpu == NULL || Cpu->VendorContext == NULL) {
@@ -301,11 +478,13 @@ IntelVmExitHandler(
             MAXULONG, 0, 0);
     }
     context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
+    context->LastExitEntryTsc = __rdtsc();
     if (__vmx_vmread(VMCS_EXIT_REASON, &value) != 0) {
         KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
             MAXULONG, 1, 0);
     }
-    reason = (ULONG)value & 0xffffu;
+    rawReason = (ULONG)value;
+    reason = rawReason & 0xffffu;
     if (__vmx_vmread(VMCS_EXIT_INSTRUCTION_LENGTH, &value) != 0) {
         KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
             reason, 2, 0);
@@ -316,8 +495,30 @@ IntelVmExitHandler(
             reason, 3, 0);
     }
     guestRip = value;
-    IntelPreserveVectoringEvent(instructionLength);
+    IntelRecordExit(
+        context, rawReason, reason, instructionLength, guestRip);
+    if ((rawReason & VMX_EXIT_REASON_ENTRY_FAILURE) != 0) {
+        KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
+            Cpu->ProcessorIndex, rawReason, guestRip);
+    }
+    status = IntelRestoreVectoringEvent(
+        instructionLength, &pendingInformation);
+    if (!NT_SUCCESS(status)) {
+        KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
+            Cpu->ProcessorIndex, 9, guestRip);
+    }
     IntelFlushEptIfNeeded(context);
+
+    if (reason == VMX_EXIT_INIT_SIGNAL) {
+        /*
+         * Processor reset/hotplug is unsupported while JohnSmith is active.
+         * Intel specifies that an INIT-induced VM exit has not modified the
+         * guest state.  Leave the VMCS active and resume that unchanged state;
+         * a subsequent SIPI is then discarded by hardware because the guest
+         * is not in the wait-for-SIPI activity state.
+         */
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+    }
 
     if (reason == VMX_EXIT_CPUID) {
         __cpuidex(cpuid, (int)(ULONG)Registers->Rax,
@@ -326,8 +527,9 @@ IntelVmExitHandler(
         Registers->Rbx = (ULONG)cpuid[1];
         Registers->Rcx = (ULONG)cpuid[2];
         Registers->Rdx = (ULONG)cpuid[3];
-        (VOID)IntelVmWrite(VMCS_GUEST_RIP, guestRip + instructionLength);
-        return INTEL_VMEXIT_RESUME;
+        IntelAdvanceGuestRip(
+            context, Cpu, reason, guestRip, instructionLength);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_EXCEPTION_OR_NMI) {
@@ -343,18 +545,30 @@ IntelVmExitHandler(
                 VMCS_EXIT_INTERRUPTION_ERROR, &errorCode);
         }
         information &= VMX_EVENT_INFORMATION_MASK;
-        IntelInjectException((ULONG)information, (ULONG)errorCode);
-        return INTEL_VMEXIT_RESUME;
+        IntelInjectException(
+            (ULONG)information,
+            (ULONG)errorCode,
+            pendingInformation,
+            Cpu,
+            reason,
+            guestRip);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_CR_ACCESS) {
         if (!IntelHandleCrAccess(Registers)) {
-            IntelInjectException(VMX_ENTRY_INJECT_GP, 0);
+            IntelInjectException(
+                VMX_ENTRY_INJECT_GP,
+                0,
+                pendingInformation,
+                Cpu,
+                reason,
+                guestRip);
         } else {
-            (VOID)IntelVmWrite(
-                VMCS_GUEST_RIP, guestRip + instructionLength);
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
         }
-        return INTEL_VMEXIT_RESUME;
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_RDMSR) {
@@ -371,12 +585,18 @@ IntelVmExitHandler(
             msrValue = __readmsr(msr);
             Registers->Rax = (ULONG)msrValue;
             Registers->Rdx = (ULONG)(msrValue >> 32);
-            (VOID)IntelVmWrite(
-                VMCS_GUEST_RIP, guestRip + instructionLength);
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
         } else {
-            IntelInjectException(VMX_ENTRY_INJECT_GP, 0);
+            IntelInjectException(
+                VMX_ENTRY_INJECT_GP,
+                0,
+                pendingInformation,
+                Cpu,
+                reason,
+                guestRip);
         }
-        return INTEL_VMEXIT_RESUME;
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_WRMSR) {
@@ -386,42 +606,36 @@ IntelVmExitHandler(
             (Registers->Rax & MAXULONG) == 0 &&
             (Registers->Rdx & MAXULONG) == 0) {
             __writemsr(IA32_S_CET, 0);
-            (VOID)IntelVmWrite(
-                VMCS_GUEST_RIP, guestRip + instructionLength);
-            return INTEL_VMEXIT_RESUME;
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
+            return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
         }
-        IntelInjectException(VMX_ENTRY_INJECT_GP, 0);
-        return INTEL_VMEXIT_RESUME;
+        IntelInjectException(
+            VMX_ENTRY_INJECT_GP,
+            0,
+            pendingInformation,
+            Cpu,
+            reason,
+            guestRip);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_EPT_VIOLATION) {
-        ULONG64 qualification;
-        ULONG64 linearAddress;
-        ULONG errorCode = 0;
-        ULONG64 csSelector;
+        ULONG64 qualification = 0;
+        ULONG64 guestPhysical = 0;
 
-        if (!IntelVmReadValue(VMCS_EXIT_QUALIFICATION, &qualification)) {
+        if (!IntelVmReadValue(VMCS_EXIT_QUALIFICATION, &qualification) ||
+            !IntelVmReadValue(
+                VMCS_GUEST_PHYSICAL_ADDRESS, &guestPhysical)) {
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 5, guestRip);
         }
-        if ((qualification & (1ull << 7)) == 0 ||
-            !IntelVmReadValue(VMCS_GUEST_LINEAR_ADDRESS, &linearAddress)) {
-            IntelInjectException(VMX_ENTRY_INJECT_GP, 0);
-            return INTEL_VMEXIT_RESUME;
-        }
-        if ((qualification & ((1ull << 3) | (1ull << 4) |
-                              (1ull << 5))) != 0) {
-            errorCode |= 1;
-        }
-        if ((qualification & (1ull << 1)) != 0) errorCode |= 2;
-        if (IntelVmReadValue(VMCS_GUEST_CS_SELECTOR, &csSelector) &&
-            (csSelector & 3) != 0) {
-            errorCode |= 4;
-        }
-        if ((qualification & (1ull << 2)) != 0) errorCode |= 16;
-        __writecr2(linearAddress);
-        IntelInjectException(VMX_ENTRY_INJECT_PF, errorCode);
-        return INTEL_VMEXIT_RESUME;
+        KeBugCheckEx(
+            HYPERVISOR_ERROR,
+            INTEL_BUGCHECK_EPT_VIOLATION,
+            qualification,
+            guestPhysical,
+            guestRip);
     }
 
     if (reason == VMX_EXIT_EPT_MISCONFIGURATION) {
@@ -434,12 +648,18 @@ IntelVmExitHandler(
 
     if (reason == VMX_EXIT_XSETBV) {
         if (IntelHandleXsetbv(Registers)) {
-            (VOID)IntelVmWrite(
-                VMCS_GUEST_RIP, guestRip + instructionLength);
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
         } else {
-            IntelInjectException(VMX_ENTRY_INJECT_GP, 0);
+            IntelInjectException(
+                VMX_ENTRY_INJECT_GP,
+                0,
+                pendingInformation,
+                Cpu,
+                reason,
+                guestRip);
         }
-        return INTEL_VMEXIT_RESUME;
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (reason == VMX_EXIT_VMCALL) {
@@ -461,7 +681,15 @@ IntelVmExitHandler(
                     INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 4, 0);
             }
             context->ResumeRsp = value;
-            context->ResumeRip = guestRip + instructionLength;
+            status = IntelGetAdvancedGuestRip(
+                context,
+                guestRip,
+                instructionLength,
+                &context->ResumeRip);
+            if (!NT_SUCCESS(status)) {
+                KeBugCheckEx(HYPERVISOR_ERROR,
+                    INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 10, guestRip);
+            }
             if (context->Vpid != 0) {
                 INTEL_INVALIDATION_DESCRIPTOR descriptor;
                 descriptor.Context = context->Vpid;
@@ -475,15 +703,17 @@ IntelVmExitHandler(
             }
             context->Launched = FALSE;
             context->VmxOn = FALSE;
-            return INTEL_VMEXIT_STOP;
+            return IntelCompleteVmExit(context, INTEL_VMEXIT_STOP);
         }
-        IntelInjectInvalidOpcode();
-        return INTEL_VMEXIT_RESUME;
+        IntelInjectInvalidOpcode(
+            pendingInformation, Cpu, reason, guestRip);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     if (IntelIsVmxInstructionExit(reason)) {
-        IntelInjectInvalidOpcode();
-        return INTEL_VMEXIT_RESUME;
+        IntelInjectInvalidOpcode(
+            pendingInformation, Cpu, reason, guestRip);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
     KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,

@@ -55,6 +55,9 @@ struct _HV_BACKEND_OPS {
     VOID (*FreeCpu)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
     NTSTATUS (*Start)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
     NTSTATUS (*Stop)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
+    VOID (*ReportStartFailure)(
+        _In_ HV_STATE* State,
+        _In_ const HV_CPU* Cpu);
     NTSTATUS (*QueryOwnedPageAccess)(
         _Inout_ HV_STATE* State,
         _In_ PHYSICAL_ADDRESS PhysicalAddress,

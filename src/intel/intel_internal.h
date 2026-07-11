@@ -179,6 +179,7 @@
 #define EPT_2MB_ADDRESS_MASK                0x000FFFFFFFE00000ull
 
 #define VMX_EXIT_EXCEPTION_OR_NMI           0u
+#define VMX_EXIT_INIT_SIGNAL                3u
 #define VMX_EXIT_CPUID                      10u
 #define VMX_EXIT_VMCALL                     18u
 #define VMX_EXIT_CR_ACCESS                  28u
@@ -187,15 +188,34 @@
 #define VMX_EXIT_EPT_VIOLATION              48u
 #define VMX_EXIT_EPT_MISCONFIGURATION       49u
 #define VMX_EXIT_XSETBV                     55u
+#define VMX_EXIT_REASON_ENTRY_FAILURE       (1u << 31)
 #define VMX_ENTRY_INJECT_UD                 0x80000306u
 #define VMX_ENTRY_INJECT_GP                 0x80000B0Du
-#define VMX_ENTRY_INJECT_PF                 0x80000B0Eu
 #define INTEL_BUGCHECK_UNEXPECTED_EXIT      0x49564D58u
 #define INTEL_BUGCHECK_INVALIDATION         0x494E5645u
+#define INTEL_BUGCHECK_EVENT_COLLISION      0x49455654u
+#define INTEL_BUGCHECK_EPT_VIOLATION        0x45505456u
 
 #define INVEPT_SINGLE_CONTEXT               1u
 #define INVEPT_ALL_CONTEXTS                 2u
 #define INVVPID_SINGLE_CONTEXT              1u
+
+#define INTEL_START_STAGE_NONE              0u
+#define INTEL_START_STAGE_CET               1u
+#define INTEL_START_STAGE_FEATURE_CONTROL   2u
+#define INTEL_START_STAGE_VMXON             3u
+#define INTEL_START_STAGE_VMCLEAR           4u
+#define INTEL_START_STAGE_VMPTRLD           5u
+#define INTEL_START_STAGE_VMCS_SETUP        6u
+#define INTEL_START_STAGE_INVEPT            7u
+#define INTEL_START_STAGE_INVVPID           8u
+#define INTEL_START_STAGE_VMLAUNCH          9u
+
+#define INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION (1u << 3)
+#define INTEL_CONTROL_FAIL_BITMAPS              (1u << 4)
+#define INTEL_CONTROL_FAIL_SECONDARY_REQUIRED   (1u << 5)
+#define INTEL_CONTROL_FAIL_EXIT_REQUIRED        (1u << 6)
+#define INTEL_CONTROL_FAIL_ENTRY_REQUIRED       (1u << 7)
 
 typedef struct _INTEL_SLAT_SPLIT {
     LIST_ENTRY Link;

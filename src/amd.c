@@ -263,6 +263,27 @@ AmdCurrentCpuMatches(
     return KeGetProcessorIndexFromNumber(&number) == Cpu->ProcessorIndex;
 }
 
+static VOID
+AmdReportStartFailure(
+    _In_ HV_STATE* State,
+    _In_ const HV_CPU* Cpu
+    )
+{
+    const AMD_CPU_CONTEXT* context;
+
+    UNREFERENCED_PARAMETER(State);
+    if (Cpu == NULL || Cpu->VendorContext == NULL) {
+        return;
+    }
+    context = (const AMD_CPU_CONTEXT*)Cpu->VendorContext;
+    HV_LOG_ERROR(
+        "CPU %lu SVM start failed: NTSTATUS 0x%08X, EXITCODE "
+        "0x%016llX.\n",
+        Cpu->ProcessorIndex,
+        (ULONG)Cpu->Status,
+        context->Vmcb != NULL ? context->Vmcb->Control.ExitCode : 0);
+}
+
 static NTSTATUS
 AmdStart(
     _Inout_ HV_STATE* State,
@@ -348,6 +369,7 @@ static const HV_BACKEND_OPS AmdBackendOps = {
     AmdFreeCpu,
     AmdStart,
     AmdStop,
+    AmdReportStartFailure,
     AmdQueryOwnedPageAccess,
     AmdSetOwnedPageAccess
 };

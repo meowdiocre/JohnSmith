@@ -3,6 +3,7 @@
 #include "hv.h"
 
 #define INTEL_HOST_STACK_SIZE       (16u * 1024u)
+#define INTEL_EXIT_HISTORY_COUNT    64u
 
 typedef enum _INTEL_VMEXIT_ACTION {
     INTEL_VMEXIT_RESUME = 0,
@@ -26,6 +27,20 @@ typedef struct _INTEL_GUEST_REGISTERS {
     ULONG64 R14;
     ULONG64 R15;
 } INTEL_GUEST_REGISTERS;
+
+typedef struct _INTEL_EXIT_RECORD {
+    volatile ULONG64 Sequence;
+    ULONG64 GuestRip;
+    ULONG64 ExitQualification;
+    ULONG64 GuestLinearAddress;
+    ULONG64 GuestPhysicalAddress;
+    ULONG Reason;
+    ULONG InstructionLength;
+    ULONG ExitInterruptionInformation;
+    ULONG IdtVectoringInformation;
+    ULONG EntryInterruptionInformation;
+    ULONG RawReason;
+} INTEL_EXIT_RECORD;
 
 typedef struct _INTEL_CPU_CONTEXT {
     PVOID Vmxon;
@@ -62,11 +77,32 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG64 ResumeSysenterCs;
     ULONG64 ResumeSysenterEsp;
     ULONG64 ResumeSysenterEip;
+    ULONG StartFailureStage;
+    ULONG ControlFailureMask;
+    ULONG PinControls;
+    ULONG PrimaryControls;
+    ULONG SecondaryControls;
+    ULONG ExitControls;
+    ULONG EntryControls;
+    ULONG DesiredPrimaryControls;
+    ULONG DesiredSecondaryControls;
+    ULONG RequiredSecondaryControls;
+    ULONG RequiredExitControls;
+    ULONG RequiredEntryControls;
+    volatile LONG64 ExitSequence;
+    volatile LONG64 CompletedExitSequence;
+    ULONG64 LastExitEntryTsc;
+    ULONG64 LastExitCompletionTsc;
+    INTEL_EXIT_RECORD ExitHistory[INTEL_EXIT_HISTORY_COUNT];
 } INTEL_CPU_CONTEXT;
 
 C_ASSERT(FIELD_OFFSET(HV_CPU, VendorContext) == 16);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRsp) == 56);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRip) == 64);
+C_ASSERT((INTEL_EXIT_HISTORY_COUNT & (INTEL_EXIT_HISTORY_COUNT - 1)) == 0);
+C_ASSERT(sizeof(INTEL_EXIT_RECORD) == 64);
+C_ASSERT((FIELD_OFFSET(INTEL_CPU_CONTEXT, ExitSequence) & 7) == 0);
+C_ASSERT((FIELD_OFFSET(INTEL_CPU_CONTEXT, CompletedExitSequence) & 7) == 0);
 
 NTSTATUS
 IntelSetLaunchState(

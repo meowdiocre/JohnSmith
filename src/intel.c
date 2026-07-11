@@ -283,6 +283,70 @@ IntelCurrentCpuMatches(
     return KeGetProcessorIndexFromNumber(&number) == Cpu->ProcessorIndex;
 }
 
+static PCSTR
+IntelStartStageName(
+    _In_ ULONG Stage
+    )
+{
+    switch (Stage) {
+    case INTEL_START_STAGE_CET: return "CET validation";
+    case INTEL_START_STAGE_FEATURE_CONTROL: return "feature control";
+    case INTEL_START_STAGE_VMXON: return "VMXON";
+    case INTEL_START_STAGE_VMCLEAR: return "VMCLEAR";
+    case INTEL_START_STAGE_VMPTRLD: return "VMPTRLD";
+    case INTEL_START_STAGE_VMCS_SETUP: return "VMCS setup";
+    case INTEL_START_STAGE_INVEPT: return "INVEPT";
+    case INTEL_START_STAGE_INVVPID: return "INVVPID";
+    case INTEL_START_STAGE_VMLAUNCH: return "VMLAUNCH";
+    default: return "preflight";
+    }
+}
+
+static VOID
+IntelReportStartFailure(
+    _In_ HV_STATE* State,
+    _In_ const HV_CPU* Cpu
+    )
+{
+    const INTEL_CPU_CONTEXT* context;
+
+    UNREFERENCED_PARAMETER(State);
+    if (Cpu == NULL || Cpu->VendorContext == NULL) {
+        return;
+    }
+    context = (const INTEL_CPU_CONTEXT*)Cpu->VendorContext;
+    HV_LOG_ERROR(
+        "CPU %lu start failed at %s (stage %lu): NTSTATUS 0x%08X, "
+        "VM-instruction error %lu, VPID %u.\n",
+        Cpu->ProcessorIndex,
+        IntelStartStageName(context->StartFailureStage),
+        context->StartFailureStage,
+        (ULONG)Cpu->Status,
+        context->LastVmxError,
+        context->Vpid);
+    if (context->StartFailureStage == INTEL_START_STAGE_VMCS_SETUP &&
+        context->ControlFailureMask != 0) {
+        HV_LOG_ERROR(
+            "CPU %lu VMCS control mismatch 0x%02X: pin=0x%08X, "
+            "primary=0x%08X/desired=0x%08X, "
+            "secondary=0x%08X/desired=0x%08X/required=0x%08X, "
+            "exit=0x%08X/required=0x%08X, "
+            "entry=0x%08X/required=0x%08X.\n",
+            Cpu->ProcessorIndex,
+            context->ControlFailureMask,
+            context->PinControls,
+            context->PrimaryControls,
+            context->DesiredPrimaryControls,
+            context->SecondaryControls,
+            context->DesiredSecondaryControls,
+            context->RequiredSecondaryControls,
+            context->ExitControls,
+            context->RequiredExitControls,
+            context->EntryControls,
+            context->RequiredEntryControls);
+    }
+}
+
 static NTSTATUS
 IntelStart(
     _Inout_ HV_STATE* State,
@@ -300,14 +364,16 @@ IntelStart(
     if (!IntelCurrentCpuMatches(Cpu) || Cpu->VendorContext == NULL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
+    context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
+    context->StartFailureStage = INTEL_START_STAGE_CET;
     status = IntelValidateSupervisorCet(NULL);
     if (!NT_SUCCESS(status)) {
         return status;
     }
-    context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
     context->OriginalCr0 = __readcr0();
     context->OriginalCr4 = __readcr4();
 
+    context->StartFailureStage = INTEL_START_STAGE_FEATURE_CONTROL;
     featureControl = __readmsr(IA32_FEATURE_CONTROL);
     if ((featureControl & (1ull | (1ull << 2))) !=
         (1ull | (1ull << 2))) {
@@ -321,6 +387,7 @@ IntelStart(
     __writecr0(cr0);
     __writecr4(cr4);
 
+    context->StartFailureStage = INTEL_START_STAGE_VMXON;
     vmxonPhysical = (ULONG64)context->VmxonPhysical.QuadPart;
     if (__vmx_on(&vmxonPhysical) != 0) {
         status = STATUS_HV_FEATURE_UNAVAILABLE;
@@ -329,11 +396,17 @@ IntelStart(
     context->VmxOn = TRUE;
 
     vmcsPhysical = (ULONG64)context->VmcsPhysical.QuadPart;
-    if (__vmx_vmclear(&vmcsPhysical) != 0 ||
-        __vmx_vmptrld(&vmcsPhysical) != 0) {
+    context->StartFailureStage = INTEL_START_STAGE_VMCLEAR;
+    if (__vmx_vmclear(&vmcsPhysical) != 0) {
         status = STATUS_HV_INVALID_VP_STATE;
         goto LeaveVmx;
     }
+    context->StartFailureStage = INTEL_START_STAGE_VMPTRLD;
+    if (__vmx_vmptrld(&vmcsPhysical) != 0) {
+        status = STATUS_HV_INVALID_VP_STATE;
+        goto LeaveVmx;
+    }
+    context->StartFailureStage = INTEL_START_STAGE_VMCS_SETUP;
     status = IntelSetupVmcs(State, Cpu);
     if (!NT_SUCCESS(status)) {
         goto LeaveVmx;
@@ -348,12 +421,14 @@ IntelStart(
                 ->EptVpidCapabilities & (1ull << 25)) != 0
             ? INVEPT_SINGLE_CONTEXT : INVEPT_ALL_CONTEXTS;
         if (type == INVEPT_ALL_CONTEXTS) descriptor.Context = 0;
+        context->StartFailureStage = INTEL_START_STAGE_INVEPT;
         if (IntelAsmInvept(type, &descriptor) != 0) {
             status = STATUS_HV_OPERATION_FAILED;
             goto LeaveVmx;
         }
         if (context->Vpid != 0) {
             descriptor.Context = context->Vpid;
+            context->StartFailureStage = INTEL_START_STAGE_INVVPID;
             if (IntelAsmInvvpid(
                     INVVPID_SINGLE_CONTEXT, &descriptor) != 0) {
                 status = STATUS_HV_OPERATION_FAILED;
@@ -362,8 +437,10 @@ IntelStart(
         }
     }
 
+    context->StartFailureStage = INTEL_START_STAGE_VMLAUNCH;
     context->Launched = TRUE;
     if (IntelAsmLaunch() == 0) {
+        context->StartFailureStage = INTEL_START_STAGE_NONE;
         return STATUS_SUCCESS;
     }
     context->Launched = FALSE;
@@ -429,6 +506,7 @@ static const HV_BACKEND_OPS IntelBackendOps = {
     IntelFreeCpu,
     IntelStart,
     IntelStop,
+    IntelReportStartFailure,
     IntelQueryOwnedPageAccess,
     IntelSetOwnedPageAccess
 };

@@ -1,5 +1,7 @@
 # JohnSmith documentation
 
+![runned-in-win10](./static/img/testrun.png)
+
 Primary-source policy for architecture work. Snapshot: **2026-07-11**.
 
 ## Rules

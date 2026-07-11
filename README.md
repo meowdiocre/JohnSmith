@@ -24,13 +24,15 @@ JohnSmith is a versatile, multi-purpose x64 hypervisor designed for red teamer.
 - Visual Studio 2022 with Desktop C++ and Windows Driver Kit 10.0.26100.
 - Hyper-V, VBS, and other active hypervisors disabled.
 - Intel `IA32_S_CET` must be zero, AMD CET
-  must be disabled. ( Root CET/SSP state virtualization is not implemented. )
+  must be disabled. Root CET/SSP state virtualization is not implemented.
 
 ## Limits
 
 - CPUID is passed through unchanged; nested virtualization is not implemented.
 - Guest VMX/SVM instructions receive `#UD`, except for the checked CPL0 stop call.
-- Processor and physical-memory hot-add/remove are unsupported while active.
+- Processor reset and processor/physical-memory hot-add or removal are
+  unsupported while active. Post-boot INIT signals are deliberately dropped;
+  JohnSmith does not move an active guest CPU into wait-for-SIPI state.
 
 
 ## Documentation

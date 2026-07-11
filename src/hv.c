@@ -66,6 +66,7 @@ HvIsBackendContractValid(
            Backend->FreeCpu != NULL &&
            Backend->Start != NULL &&
            Backend->Stop != NULL &&
+           Backend->ReportStartFailure != NULL &&
            Backend->QueryOwnedPageAccess != NULL &&
            Backend->SetOwnedPageAccess != NULL;
 }
@@ -183,19 +184,22 @@ HvStartProcessors(
     context.Failure = FALSE;
     KeIpiGenericCall(HvStartProcessor, (ULONG_PTR)&context);
 
-    if (InterlockedCompareExchange(&context.Failure, 0, 0) != FALSE) {
-        status = STATUS_HV_OPERATION_FAILED;
-    }
-
     for (index = 0; index < State->CpuCount; ++index) {
         if (InterlockedCompareExchange(&State->Cpus[index].State, 0, 0) !=
             HV_CPU_RUNNING) {
+            State->Backend->ReportStartFailure(
+                State, &State->Cpus[index]);
             if (NT_SUCCESS(status)) {
                 status = NT_SUCCESS(State->Cpus[index].Status)
                     ? STATUS_HV_OPERATION_FAILED
                     : State->Cpus[index].Status;
             }
         }
+    }
+
+    if (InterlockedCompareExchange(&context.Failure, 0, 0) != FALSE &&
+        NT_SUCCESS(status)) {
+        status = STATUS_HV_OPERATION_FAILED;
     }
 
     return status;
