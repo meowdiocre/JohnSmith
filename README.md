@@ -12,8 +12,8 @@ JohnSmith is a versatile, multi-purpose x64 hypervisor designed for red teamer.
 - Intel VMX/EPT and AMD SVM/NPT backends.
 - Identity SLAT up to 512 GiB with explicit capability and range checks.
 - Runtime 4 KiB permission changes with cross-CPU EPT/NPT invalidation.
-- Transparent CPUID passthrough with explicit nested-virtualization rejection.
-- VMX CR0/CR4 virtualization, VPID, AMD ASIDs, MSR and I/O bitmaps.
+- CPUID passthrough with feature masking for the no-nested-virtualization policy.
+- VMX CR0/CR4 virtualization, VPID, AMD ASIDs, and MSR bitmaps.
 - One CPL0 signature-and-cookie-checked hypercall, used only for shutdown.
 - One internally allocated contiguous introspection page; no external address input.
 
@@ -28,7 +28,7 @@ JohnSmith is a versatile, multi-purpose x64 hypervisor designed for red teamer.
 
 ## Limits
 
-- CPUID is passed through unchanged; nested virtualization is not implemented.
+- CPUID is passed through with VMX and unavailable VMX-controlled features hidden; nested virtualization is not implemented.
 - Guest VMX/SVM instructions receive `#UD`, except for the checked CPL0 stop call.
 - Processor reset and processor/physical-memory hot-add or removal are
   unsupported while active. Post-boot INIT signals are deliberately dropped;
@@ -56,7 +56,7 @@ Enforcement.
 git clone https://github.com/hfiref0x/KDU.git external/KDU
 
 # build JohnSmith.sys (Release or Debug)
-d                 # DSE off > service load > DSE restored
+.\tools\load-kdu.ps1                 # DSE off > service load > DSE restored
 .\tools\unload-kdu.ps1               # stop + remove the service
 ```
 

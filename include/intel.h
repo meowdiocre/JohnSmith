@@ -5,6 +5,14 @@
 #define INTEL_HOST_STACK_SIZE       (16u * 1024u)
 #define INTEL_EXIT_HISTORY_COUNT    64u
 
+#ifndef JOHNSMITH_DIAGNOSTICS
+#if DBG
+#define JOHNSMITH_DIAGNOSTICS 1
+#else
+#define JOHNSMITH_DIAGNOSTICS 0
+#endif
+#endif
+
 typedef enum _INTEL_VMEXIT_ACTION {
     INTEL_VMEXIT_RESUME = 0,
     INTEL_VMEXIT_STOP = 1
@@ -55,12 +63,8 @@ typedef struct _INTEL_CPU_CONTEXT {
     BOOLEAN VmxOn;
     BOOLEAN Launched;
     PVOID MsrBitmap;
-    PVOID IoBitmapA;
-    PVOID IoBitmapB;
     PVOID BackendContext;
     PHYSICAL_ADDRESS MsrBitmapPhysical;
-    PHYSICAL_ADDRESS IoBitmapAPhysical;
-    PHYSICAL_ADDRESS IoBitmapBPhysical;
     ULONG64 EptPointer;
     volatile LONG64 SlatGeneration;
     ULONG64 StopCookie;

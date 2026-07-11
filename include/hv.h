@@ -48,13 +48,19 @@ typedef enum _HV_LIFECYCLE {
  */
 struct _HV_BACKEND_OPS {
     PCSTR Name;
+    /* PASSIVE_LEVEL callbacks. */
     NTSTATUS (*Support)(VOID);
     NTSTATUS (*Prepare)(_Inout_ HV_STATE* State);
     VOID (*Free)(_Inout_ HV_STATE* State);
     NTSTATUS (*PrepareCpu)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
     VOID (*FreeCpu)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
+    /*
+     * IPI_LEVEL callbacks: called inside KeIpiGenericCall.  Do not allocate,
+     * block, log, or touch pageable code.
+     */
     NTSTATUS (*Start)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
     NTSTATUS (*Stop)(_Inout_ HV_STATE* State, _Inout_ HV_CPU* Cpu);
+    /* PASSIVE_LEVEL callback. */
     VOID (*ReportStartFailure)(
         _In_ HV_STATE* State,
         _In_ const HV_CPU* Cpu);
@@ -82,7 +88,6 @@ struct _HV_STATE {
     HV_CPU* Cpus;
     ULONG CpuCount;
     volatile LONG Lifecycle;
-    BOOLEAN IntrospectionActive;
 };
 
 _IRQL_requires_(PASSIVE_LEVEL)

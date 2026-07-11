@@ -198,7 +198,10 @@ HvIntrospectionStop(
 {
     NTSTATUS status = STATUS_SUCCESS;
 
-    if (State == NULL || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+    if (State == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
 

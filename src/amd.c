@@ -125,25 +125,14 @@ AmdPrepare(
         return STATUS_HV_FEATURE_UNAVAILABLE;
     }
     __cpuid(registers, 0x8000000A);
-    context->MaxAsid = (ULONG)registers[1];
+    context->AsidCount = (ULONG)registers[1];
     context->TlbFlushCommand =
         (((ULONG)registers[3] & AMD_SVM_FEATURE_FLUSH_BY_ASID) != 0)
         ? 3 : 1;
     context->SlatGeneration = 1;
     State->BackendContext = context;
     status = AmdBuildNpt(context);
-    if (NT_SUCCESS(status)) {
-        context->Iopm = AmdAllocateContiguous(AMD_IOPM_SIZE);
-        if (context->Iopm == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        } else {
-            context->IopmPhysical = MmGetPhysicalAddress(context->Iopm);
-        }
-    }
     if (!NT_SUCCESS(status)) {
-        if (context->Iopm != NULL) {
-            MmFreeContiguousMemory(context->Iopm);
-        }
         AmdFreeNpt(context);
         ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
         State->BackendContext = NULL;
@@ -159,10 +148,6 @@ AmdFree(
     AMD_BACKEND_CONTEXT* context;
     if (State == NULL || State->BackendContext == NULL) return;
     context = (AMD_BACKEND_CONTEXT*)State->BackendContext;
-    if (context->Iopm != NULL) {
-        MmFreeContiguousMemory(context->Iopm);
-        context->Iopm = NULL;
-    }
     AmdFreeNpt(context);
     ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
     State->BackendContext = NULL;

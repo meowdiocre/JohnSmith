@@ -156,7 +156,6 @@ IntelSetupVmcs(
         __cpuid(cpuid, 0x80000001);
         if ((((ULONG)cpuid[3]) & (1u << 27)) != 0) {
             desiredSecondary |= VMX_SECONDARY_ENABLE_RDTSCP;
-            requiredSecondary |= VMX_SECONDARY_ENABLE_RDTSCP;
         }
     }
     __cpuid(cpuid, 0);
@@ -164,7 +163,6 @@ IntelSetupVmcs(
         __cpuidex(cpuid, 7, 0);
         if ((((ULONG)cpuid[1]) & (1u << 10)) != 0) {
             desiredSecondary |= VMX_SECONDARY_ENABLE_INVPCID;
-            requiredSecondary |= VMX_SECONDARY_ENABLE_INVPCID;
         }
     }
     __cpuid(cpuid, 0);
@@ -172,7 +170,6 @@ IntelSetupVmcs(
         __cpuidex(cpuid, 0xD, 1);
         if ((((ULONG)cpuid[0]) & (1u << 3)) != 0) {
             desiredSecondary |= VMX_SECONDARY_ENABLE_XSAVES;
-            requiredSecondary |= VMX_SECONDARY_ENABLE_XSAVES;
         }
     }
     if ((backend->EptVpidCapabilities & (1ull << 32)) != 0 &&
@@ -182,7 +179,6 @@ IntelSetupVmcs(
     }
 
     desiredPrimary = VMX_PRIMARY_ACTIVATE_SECONDARY |
-                     VMX_PRIMARY_USE_IO_BITMAPS |
                      VMX_PRIMARY_USE_MSR_BITMAPS;
     pinControls = IntelAdjustControls(0, pinMsr);
     primaryControls = IntelAdjustControls(
@@ -210,9 +206,7 @@ IntelSetupVmcs(
     if ((primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION;
     }
-    if ((primaryControls & (VMX_PRIMARY_USE_IO_BITMAPS |
-                            VMX_PRIMARY_USE_MSR_BITMAPS)) !=
-        (VMX_PRIMARY_USE_IO_BITMAPS | VMX_PRIMARY_USE_MSR_BITMAPS)) {
+    if ((primaryControls & VMX_PRIMARY_USE_MSR_BITMAPS) == 0) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_BITMAPS;
     }
     if ((secondaryControls & requiredSecondary) != requiredSecondary) {
@@ -257,8 +251,6 @@ IntelSetupVmcs(
     VMX_WRITE(VMCS_ENTRY_EXCEPTION_ERROR, 0);
     VMX_WRITE(VMCS_ENTRY_INSTRUCTION_LENGTH, 0);
     VMX_WRITE(VMCS_TPR_THRESHOLD, 0);
-    VMX_WRITE(VMCS_IO_BITMAP_A, context->IoBitmapAPhysical.QuadPart);
-    VMX_WRITE(VMCS_IO_BITMAP_B, context->IoBitmapBPhysical.QuadPart);
     VMX_WRITE(VMCS_MSR_BITMAP, context->MsrBitmapPhysical.QuadPart);
     VMX_WRITE(VMCS_EPT_POINTER, eptp);
     VMX_WRITE(VMCS_VPID, context->Vpid);

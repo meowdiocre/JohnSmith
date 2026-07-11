@@ -284,7 +284,6 @@ HvResetStoppedState(
     State->BackendContext = NULL;
     State->Cpus = NULL;
     State->CpuCount = 0;
-    State->IntrospectionActive = FALSE;
     InterlockedExchange(&State->Lifecycle, HV_LIFECYCLE_STOPPED);
 }
 
@@ -383,7 +382,6 @@ HvStart(
     if (!NT_SUCCESS(status)) {
         goto FailPreparedCpus;
     }
-    HvGlobalState.IntrospectionActive = TRUE;
 
     status = HvStartProcessors(&HvGlobalState);
     if (!NT_SUCCESS(status)) {
@@ -401,7 +399,6 @@ FailIntrospection:
     if (!NT_SUCCESS(cleanup_status)) {
         HvFailStop(&HvGlobalState, HV_FAIL_STOP_ROLLBACK);
     }
-    HvGlobalState.IntrospectionActive = FALSE;
 FailPreparedCpus:
     HvReleaseCpus(&HvGlobalState, prepared_count);
     backend->Free(&HvGlobalState);
@@ -423,6 +420,10 @@ HvStop(
         return;
     }
 
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        HvFailStop(State, HV_FAIL_STOP_SHUTDOWN);
+    }
+
     if (InterlockedCompareExchange(
             &State->Lifecycle,
             HV_LIFECYCLE_STOPPING,
@@ -431,10 +432,10 @@ HvStop(
             HV_LIFECYCLE_STOPPED) {
             return;
         }
-        HvFailStop(State, HV_FAIL_STOP_SHUTDOWN);
-    }
-
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        if (InterlockedCompareExchange(&State->Lifecycle, 0, 0) ==
+            HV_LIFECYCLE_STOPPING) {
+            return;
+        }
         HvFailStop(State, HV_FAIL_STOP_SHUTDOWN);
     }
 
@@ -445,13 +446,12 @@ HvStop(
 
     HvStopProcessorsOrFail(State, HV_FAIL_STOP_SHUTDOWN);
 
-    if (State->IntrospectionActive) {
+    {
         NTSTATUS status = HvIntrospectionStop(State);
 
         if (!NT_SUCCESS(status)) {
             HvFailStop(State, HV_FAIL_STOP_SHUTDOWN);
         }
-        State->IntrospectionActive = FALSE;
     }
 
     HvReleaseCpus(State, State->CpuCount);

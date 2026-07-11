@@ -1,12 +1,36 @@
 #include "amd_internal.h"
 
+DECLSPEC_NORETURN
+static VOID
+AmdFailEventCollision(
+    _In_ const AMD_VMCB* Vmcb,
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG64 NewInformation
+    )
+{
+    KeBugCheckEx(
+        HYPERVISOR_ERROR,
+        AMD_BUGCHECK_EVENT_COLLISION,
+        Vmcb == NULL ? MAXULONG :
+            (((ULONG64)(Cpu == NULL ? MAXULONG : Cpu->ProcessorIndex)) << 32) |
+            (Vmcb->Control.ExitCode & MAXULONG),
+        Vmcb == NULL ? NewInformation :
+            ((Vmcb->Control.EventInjection & MAXULONG) << 32) |
+            (NewInformation & MAXULONG),
+        Vmcb == NULL ? 0 : Vmcb->State.Rip);
+}
+
 static VOID
 AmdInjectException(
     _Inout_ AMD_VMCB* Vmcb,
+    _In_ const HV_CPU* Cpu,
     _In_ ULONG64 Information,
     _In_ ULONG ErrorCode
     )
 {
+    if ((Vmcb->Control.EventInjection & AMD_EVENT_VALID) != 0) {
+        AmdFailEventCollision(Vmcb, Cpu, Information);
+    }
     Vmcb->Control.EventInjection = Information |
         ((ULONG64)ErrorCode << 32);
     Vmcb->Control.VmcbClean = 0;
@@ -14,10 +38,11 @@ AmdInjectException(
 
 static VOID
 AmdInjectInvalidOpcode(
-    _Inout_ AMD_VMCB* Vmcb
+    _Inout_ AMD_VMCB* Vmcb,
+    _In_ const HV_CPU* Cpu
     )
 {
-    AmdInjectException(Vmcb, AMD_EVENT_INJECT_UD, 0);
+    AmdInjectException(Vmcb, Cpu, AMD_EVENT_INJECT_UD, 0);
 }
 
 static BOOLEAN
@@ -76,7 +101,7 @@ AmdVmExitHandler(
     exitCode = vmcb->Control.ExitCode;
     AmdPrepareTlbControl(context);
     vmcb->Control.EventInjection =
-        (vmcb->Control.ExitInterruptInfo & (1ull << 31)) != 0
+        (vmcb->Control.ExitInterruptInfo & AMD_EVENT_VALID) != 0
         ? vmcb->Control.ExitInterruptInfo : 0;
 
     if (exitCode == AMD_EXIT_INVALID &&
@@ -111,7 +136,7 @@ AmdVmExitHandler(
             } else if (msr == AMD_MSR_VM_HSAVE_PA) {
                 msrValue = context->GuestHostSavePhysical;
             } else {
-                AmdInjectException(vmcb, AMD_EVENT_INJECT_GP, 0);
+                AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
                 return AMD_VMEXIT_RESUME;
             }
             vmcb->State.Rax = (ULONG)msrValue;
@@ -124,7 +149,7 @@ AmdVmExitHandler(
                 if ((msrValue & ~validEfer) != 0 ||
                     (((msrValue ^ context->GuestEfer) & (1ull << 8)) != 0 &&
                      (vmcb->State.Cr0 & (1ull << 31)) != 0)) {
-                    AmdInjectException(vmcb, AMD_EVENT_INJECT_GP, 0);
+                    AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
                     return AMD_VMEXIT_RESUME;
                 }
                 context->GuestEfer =
@@ -136,7 +161,7 @@ AmdVmExitHandler(
             } else if (msr == AMD_MSR_VM_HSAVE_PA) {
                 context->GuestHostSavePhysical = msrValue;
             } else {
-                AmdInjectException(vmcb, AMD_EVENT_INJECT_GP, 0);
+                AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
                 return AMD_VMEXIT_RESUME;
             }
         }
@@ -146,24 +171,16 @@ AmdVmExitHandler(
     }
 
     if (exitCode == AMD_EXIT_NPF) {
-        AMD_BACKEND_CONTEXT* backend =
-            (AMD_BACKEND_CONTEXT*)context->BackendContext;
-        ULONG64 fault = vmcb->Control.ExitInfo1;
-        ULONG64 guestPhysical = vmcb->Control.ExitInfo2;
-
-        if (backend == NULL || (fault & AMD_NPF_RESERVED) != 0 ||
-            (guestPhysical < backend->MapLimit &&
-             (fault & AMD_NPF_PRESENT) == 0)) {
-            KeBugCheckEx(HYPERVISOR_ERROR, AMD_BUGCHECK_UNEXPECTED_EXIT,
-                Cpu->ProcessorIndex, (ULONG_PTR)fault,
-                (ULONG_PTR)guestPhysical);
-        }
-        AmdInjectException(vmcb, AMD_EVENT_INJECT_GP, 0);
-        return AMD_VMEXIT_RESUME;
+        KeBugCheckEx(
+            HYPERVISOR_ERROR,
+            AMD_BUGCHECK_NPF,
+            Cpu->ProcessorIndex,
+            (ULONG_PTR)vmcb->Control.ExitInfo1,
+            (ULONG_PTR)vmcb->Control.ExitInfo2);
     }
 
     if (exitCode == AMD_EXIT_INVLPGA) {
-        AmdInjectInvalidOpcode(vmcb);
+        AmdInjectInvalidOpcode(vmcb, Cpu);
         return AMD_VMEXIT_RESUME;
     }
 
@@ -172,7 +189,7 @@ AmdVmExitHandler(
             vmcb->State.Rip = vmcb->Control.NextRip;
             vmcb->Control.VmcbClean = 0;
         } else {
-            AmdInjectException(vmcb, AMD_EVENT_INJECT_GP, 0);
+            AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
         }
         return AMD_VMEXIT_RESUME;
     }
@@ -189,12 +206,12 @@ AmdVmExitHandler(
             context->Virtualized = FALSE;
             return AMD_VMEXIT_STOP;
         }
-        AmdInjectInvalidOpcode(vmcb);
+        AmdInjectInvalidOpcode(vmcb, Cpu);
         return AMD_VMEXIT_RESUME;
     }
 
     if (exitCode >= AMD_EXIT_VMRUN && exitCode <= AMD_EXIT_SKINIT) {
-        AmdInjectInvalidOpcode(vmcb);
+        AmdInjectInvalidOpcode(vmcb, Cpu);
         return AMD_VMEXIT_RESUME;
     }
 

@@ -112,7 +112,7 @@ AmdSetupVmcb(
 
     vmcb->Control.InterceptMisc1 =
         AMD_INTERCEPT_CPUID | AMD_INTERCEPT_INVLPGA |
-        AMD_INTERCEPT_IOIO | AMD_INTERCEPT_MSR;
+        AMD_INTERCEPT_MSR;
     vmcb->Control.InterceptMisc2 = AMD_INTERCEPT_SVM_INSTRUCTIONS;
     __cpuid(cpuid, 1);
     if ((((ULONG)cpuid[2]) & (1u << 26)) != 0) {
@@ -120,12 +120,11 @@ AmdSetupVmcb(
     }
     context->GuestAsid = Cpu->ProcessorIndex + 1;
     if (context->GuestAsid == 0 ||
-        context->GuestAsid >= backend->MaxAsid) {
+        context->GuestAsid >= backend->AsidCount) {
         context->GuestAsid = 1;
     }
     vmcb->Control.GuestAsid = context->GuestAsid;
     vmcb->Control.TlbControl = 1;
-    vmcb->Control.IopmBase = backend->IopmPhysical.QuadPart;
     vmcb->Control.MsrpmBase = context->MsrpmPhysical.QuadPart;
     vmcb->Control.NestedPagingEnable = 1;
     vmcb->Control.NestedCr3 =

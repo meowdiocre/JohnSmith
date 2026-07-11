@@ -29,7 +29,6 @@
 
 #define AMD_INTERCEPT_CPUID             (1u << 18)
 #define AMD_INTERCEPT_INVLPGA           (1u << 26)
-#define AMD_INTERCEPT_IOIO              (1u << 27)
 #define AMD_INTERCEPT_MSR               (1u << 28)
 #define AMD_INTERCEPT_SVM_INSTRUCTIONS  0x7fu
 #define AMD_INTERCEPT_XSETBV            (1u << 13)
@@ -42,15 +41,14 @@
 #define AMD_EXIT_MSR                    0x7Cull
 #define AMD_EXIT_NPF                    0x400ull
 #define AMD_EXIT_INVALID                MAXULONGLONG
-#define AMD_NPF_PRESENT                 (1ull << 0)
-#define AMD_NPF_RESERVED                (1ull << 3)
 #define AMD_EVENT_INJECT_UD             0x80000306ull
 #define AMD_EVENT_INJECT_GP             0x80000B0Dull
-#define AMD_EVENT_INJECT_PF             0x80000B0Eull
-#define AMD_BUGCHECK_UNEXPECTED_EXIT    0x41564D43u
-#define AMD_BUGCHECK_INVALIDATION       0x414E5054u
+#define AMD_EVENT_VALID                  (1ull << 31)
+#define AMD_BUGCHECK_UNEXPECTED_EXIT     0x41564D43u
+#define AMD_BUGCHECK_INVALIDATION        0x414E5054u
+#define AMD_BUGCHECK_EVENT_COLLISION     0x41455654u
+#define AMD_BUGCHECK_NPF                 0x414E5046u
 
-#define AMD_IOPM_SIZE                   (3u * PAGE_SIZE)
 #define AMD_MSRPM_SIZE                  (2u * PAGE_SIZE)
 #define AMD_VMCB_CLEAN_ASID             (1u << 2)
 
@@ -75,15 +73,13 @@ typedef struct _AMD_SLAT_SPLIT {
 typedef struct _AMD_BACKEND_CONTEXT {
     PVOID Pml4;
     PVOID Pdpt;
-    PVOID Iopm;
-    PHYSICAL_ADDRESS IopmPhysical;
     PVOID Pds[512];
     LIST_ENTRY SplitList;
     EX_PUSH_LOCK SlatLock;
     ULONG64 MapLimit;
     ULONG64 RamCacheFlags;
     ULONG64 MmioCacheFlags;
-    ULONG MaxAsid;
+    ULONG AsidCount;
     UCHAR TlbFlushCommand;
     volatile LONG64 SlatGeneration;
 } AMD_BACKEND_CONTEXT;

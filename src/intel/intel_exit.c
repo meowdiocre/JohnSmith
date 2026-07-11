@@ -65,21 +65,58 @@ IntelAdvanceGuestRip(
     )
 {
     ULONG64 nextRip;
+    ULONG64 interruptibility;
+    ULONG64 rflags;
+    ULONG64 debugCtl;
+    ULONG64 pendingDebug;
     NTSTATUS status;
 
     status = IntelGetAdvancedGuestRip(
         Context, GuestRip, InstructionLength, &nextRip);
-    if (NT_SUCCESS(status)) {
-        status = IntelVmWrite(VMCS_GUEST_RIP, nextRip);
+    if (!NT_SUCCESS(status) ||
+        !IntelVmReadValue(VMCS_GUEST_INTERRUPTIBILITY, &interruptibility) ||
+        !IntelVmReadValue(VMCS_GUEST_RFLAGS, &rflags)) {
+        status = STATUS_HV_INVALID_VP_STATE;
+        goto Fail;
     }
-    if (!NT_SUCCESS(status)) {
-        KeBugCheckEx(
-            HYPERVISOR_ERROR,
-            INTEL_BUGCHECK_UNEXPECTED_EXIT,
-            Cpu->ProcessorIndex,
-            ((ULONG64)Reason << 32) | 10,
-            GuestRip);
+
+    if ((interruptibility &
+         (VMX_GUEST_BLOCKING_BY_STI | VMX_GUEST_BLOCKING_BY_MOV_SS)) != 0) {
+        interruptibility &=
+            ~(VMX_GUEST_BLOCKING_BY_STI | VMX_GUEST_BLOCKING_BY_MOV_SS);
+        status = IntelVmWrite(
+            VMCS_GUEST_INTERRUPTIBILITY, interruptibility);
+        if (!NT_SUCCESS(status)) goto Fail;
     }
+
+    if ((rflags & RFLAGS_TF) != 0) {
+        if (!IntelVmReadValue(VMCS_GUEST_DEBUGCTL, &debugCtl)) {
+            status = STATUS_HV_INVALID_VP_STATE;
+            goto Fail;
+        }
+        if ((debugCtl & IA32_DEBUGCTL_BTF) == 0) {
+            if (!IntelVmReadValue(
+                    VMCS_GUEST_PENDING_DEBUG, &pendingDebug)) {
+                status = STATUS_HV_INVALID_VP_STATE;
+                goto Fail;
+            }
+            status = IntelVmWrite(
+                VMCS_GUEST_PENDING_DEBUG,
+                pendingDebug | VMX_PENDING_DEBUG_BS);
+            if (!NT_SUCCESS(status)) goto Fail;
+        }
+    }
+
+    status = IntelVmWrite(VMCS_GUEST_RIP, nextRip);
+    if (NT_SUCCESS(status)) return;
+
+Fail:
+    KeBugCheckEx(
+        HYPERVISOR_ERROR,
+        INTEL_BUGCHECK_UNEXPECTED_EXIT,
+        Cpu->ProcessorIndex,
+        ((ULONG64)Reason << 32) | 10,
+        GuestRip);
 }
 
 static NTSTATUS
@@ -184,6 +221,10 @@ IntelInjectInvalidOpcode(
     _In_ ULONG64 GuestRip
     )
 {
+    if ((PendingInformation & (1u << 31)) != 0) {
+        return;
+    }
+
     IntelInjectException(
         VMX_ENTRY_INJECT_UD,
         0,
@@ -193,6 +234,7 @@ IntelInjectInvalidOpcode(
         GuestRip);
 }
 
+#if JOHNSMITH_DIAGNOSTICS
 static ULONG64
 IntelReadDiagnosticValue(
     _In_ ULONG Field
@@ -237,6 +279,7 @@ IntelRecordExit(
     KeMemoryBarrier();
     record->Sequence = sequence;
 }
+#endif
 
 static ULONG
 IntelCompleteVmExit(
@@ -244,45 +287,51 @@ IntelCompleteVmExit(
     _In_ INTEL_VMEXIT_ACTION Action
     )
 {
+#if JOHNSMITH_DIAGNOSTICS
     LONG64 sequence = InterlockedCompareExchange64(
         &Context->ExitSequence, 0, 0);
 
     Context->LastExitCompletionTsc = __rdtsc();
     KeMemoryBarrier();
     InterlockedExchange64(&Context->CompletedExitSequence, sequence);
+#else
+    UNREFERENCED_PARAMETER(Context);
+#endif
     return (ULONG)Action;
 }
 
-static ULONG64
+static NTSTATUS
 IntelGetRegister(
     _In_ INTEL_GUEST_REGISTERS* Registers,
-    _In_ ULONG Index
+    _In_ ULONG Index,
+    _Out_ PULONG64 Value
     )
 {
-    ULONG64 value = 0;
     switch (Index) {
-    case 0: value = Registers->Rax; break;
-    case 1: value = Registers->Rcx; break;
-    case 2: value = Registers->Rdx; break;
-    case 3: value = Registers->Rbx; break;
-    case 4: (VOID)IntelVmReadValue(VMCS_GUEST_RSP, &value); break;
-    case 5: value = Registers->Rbp; break;
-    case 6: value = Registers->Rsi; break;
-    case 7: value = Registers->Rdi; break;
-    case 8: value = Registers->R8; break;
-    case 9: value = Registers->R9; break;
-    case 10: value = Registers->R10; break;
-    case 11: value = Registers->R11; break;
-    case 12: value = Registers->R12; break;
-    case 13: value = Registers->R13; break;
-    case 14: value = Registers->R14; break;
-    case 15: value = Registers->R15; break;
-    default: break;
+    case 0: *Value = Registers->Rax; return STATUS_SUCCESS;
+    case 1: *Value = Registers->Rcx; return STATUS_SUCCESS;
+    case 2: *Value = Registers->Rdx; return STATUS_SUCCESS;
+    case 3: *Value = Registers->Rbx; return STATUS_SUCCESS;
+    case 4:
+        return IntelVmReadValue(VMCS_GUEST_RSP, Value)
+            ? STATUS_SUCCESS
+            : STATUS_HV_INVALID_VP_STATE;
+    case 5: *Value = Registers->Rbp; return STATUS_SUCCESS;
+    case 6: *Value = Registers->Rsi; return STATUS_SUCCESS;
+    case 7: *Value = Registers->Rdi; return STATUS_SUCCESS;
+    case 8: *Value = Registers->R8; return STATUS_SUCCESS;
+    case 9: *Value = Registers->R9; return STATUS_SUCCESS;
+    case 10: *Value = Registers->R10; return STATUS_SUCCESS;
+    case 11: *Value = Registers->R11; return STATUS_SUCCESS;
+    case 12: *Value = Registers->R12; return STATUS_SUCCESS;
+    case 13: *Value = Registers->R13; return STATUS_SUCCESS;
+    case 14: *Value = Registers->R14; return STATUS_SUCCESS;
+    case 15: *Value = Registers->R15; return STATUS_SUCCESS;
+    default: return STATUS_NOT_SUPPORTED;
     }
-    return value;
 }
 
-static VOID
+static NTSTATUS
 IntelSetRegister(
     _Inout_ INTEL_GUEST_REGISTERS* Registers,
     _In_ ULONG Index,
@@ -290,29 +339,30 @@ IntelSetRegister(
     )
 {
     switch (Index) {
-    case 0: Registers->Rax = Value; break;
-    case 1: Registers->Rcx = Value; break;
-    case 2: Registers->Rdx = Value; break;
-    case 3: Registers->Rbx = Value; break;
-    case 4: (VOID)IntelVmWrite(VMCS_GUEST_RSP, Value); break;
-    case 5: Registers->Rbp = Value; break;
-    case 6: Registers->Rsi = Value; break;
-    case 7: Registers->Rdi = Value; break;
-    case 8: Registers->R8 = Value; break;
-    case 9: Registers->R9 = Value; break;
-    case 10: Registers->R10 = Value; break;
-    case 11: Registers->R11 = Value; break;
-    case 12: Registers->R12 = Value; break;
-    case 13: Registers->R13 = Value; break;
-    case 14: Registers->R14 = Value; break;
-    case 15: Registers->R15 = Value; break;
-    default: break;
+    case 0: Registers->Rax = Value; return STATUS_SUCCESS;
+    case 1: Registers->Rcx = Value; return STATUS_SUCCESS;
+    case 2: Registers->Rdx = Value; return STATUS_SUCCESS;
+    case 3: Registers->Rbx = Value; return STATUS_SUCCESS;
+    case 4: return IntelVmWrite(VMCS_GUEST_RSP, Value);
+    case 5: Registers->Rbp = Value; return STATUS_SUCCESS;
+    case 6: Registers->Rsi = Value; return STATUS_SUCCESS;
+    case 7: Registers->Rdi = Value; return STATUS_SUCCESS;
+    case 8: Registers->R8 = Value; return STATUS_SUCCESS;
+    case 9: Registers->R9 = Value; return STATUS_SUCCESS;
+    case 10: Registers->R10 = Value; return STATUS_SUCCESS;
+    case 11: Registers->R11 = Value; return STATUS_SUCCESS;
+    case 12: Registers->R12 = Value; return STATUS_SUCCESS;
+    case 13: Registers->R13 = Value; return STATUS_SUCCESS;
+    case 14: Registers->R14 = Value; return STATUS_SUCCESS;
+    case 15: Registers->R15 = Value; return STATUS_SUCCESS;
+    default: return STATUS_NOT_SUPPORTED;
     }
 }
 
-static BOOLEAN
+static NTSTATUS
 IntelHandleCrAccess(
-    _Inout_ INTEL_GUEST_REGISTERS* Registers
+    _Inout_ INTEL_GUEST_REGISTERS* Registers,
+    _Inout_ INTEL_CPU_CONTEXT* Context
     )
 {
     ULONG64 qualification;
@@ -321,71 +371,104 @@ IntelHandleCrAccess(
     ULONG cr;
     ULONG access;
     ULONG reg;
+    NTSTATUS status;
 
     if (!IntelVmReadValue(VMCS_EXIT_QUALIFICATION, &qualification)) {
-        return FALSE;
+        return STATUS_HV_INVALID_VP_STATE;
     }
     cr = (ULONG)(qualification & 0xf);
     access = (ULONG)((qualification >> 4) & 3);
     reg = (ULONG)((qualification >> 8) & 0xf);
 
     if (access == 0) {
-        requested = IntelGetRegister(Registers, reg);
+        status = IntelGetRegister(Registers, reg, &requested);
+        if (!NT_SUCCESS(status)) return status;
+
         if (cr == 0) {
             value = (requested | __readmsr(IA32_VMX_CR0_FIXED0)) &
                     __readmsr(IA32_VMX_CR0_FIXED1);
-            (VOID)IntelVmWrite(VMCS_GUEST_CR0, value);
-            (VOID)IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
-        } else if (cr == 3) {
-            (VOID)IntelVmWrite(VMCS_GUEST_CR3, requested);
-        } else if (cr == 4) {
+            status = IntelVmWrite(VMCS_GUEST_CR0, value);
+            if (NT_SUCCESS(status)) {
+                status = IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
+            }
+            return status;
+        }
+        if (cr == 3) {
+            status = IntelVmWrite(VMCS_GUEST_CR3, requested);
+            if (NT_SUCCESS(status) && Context->Vpid != 0) {
+                INTEL_INVALIDATION_DESCRIPTOR descriptor;
+
+                descriptor.Context = Context->Vpid;
+                descriptor.Reserved = 0;
+                if (IntelAsmInvvpid(
+                        INVVPID_SINGLE_CONTEXT, &descriptor) != 0) {
+                    status = STATUS_HV_OPERATION_FAILED;
+                }
+            }
+            return status;
+        }
+        if (cr == 4) {
             value = (requested | __readmsr(IA32_VMX_CR4_FIXED0) |
                      VMX_CR4_VMXE) & __readmsr(IA32_VMX_CR4_FIXED1);
-            (VOID)IntelVmWrite(VMCS_GUEST_CR4, value);
-            (VOID)IntelVmWrite(VMCS_CR4_READ_SHADOW, requested);
-        } else {
-            return FALSE;
+            status = IntelVmWrite(VMCS_GUEST_CR4, value);
+            if (NT_SUCCESS(status)) {
+                status = IntelVmWrite(VMCS_CR4_READ_SHADOW, requested);
+            }
+            return status;
         }
-        return TRUE;
+        return STATUS_NOT_SUPPORTED;
     }
 
     if (access == 1) {
         if (cr == 0) {
-            if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &value)) return FALSE;
+            if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &value)) {
+                return STATUS_HV_INVALID_VP_STATE;
+            }
         } else if (cr == 3) {
-            if (!IntelVmReadValue(VMCS_GUEST_CR3, &value)) return FALSE;
+            if (!IntelVmReadValue(VMCS_GUEST_CR3, &value)) {
+                return STATUS_HV_INVALID_VP_STATE;
+            }
         } else if (cr == 4) {
-            if (!IntelVmReadValue(VMCS_CR4_READ_SHADOW, &value)) return FALSE;
+            if (!IntelVmReadValue(VMCS_CR4_READ_SHADOW, &value)) {
+                return STATUS_HV_INVALID_VP_STATE;
+            }
         } else {
-            return FALSE;
+            return STATUS_NOT_SUPPORTED;
         }
-        IntelSetRegister(Registers, reg, value);
-        return TRUE;
+        return IntelSetRegister(Registers, reg, value);
     }
 
     if (access == 2 && cr == 0) {
-        if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &requested)) return FALSE;
+        if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &requested)) {
+            return STATUS_HV_INVALID_VP_STATE;
+        }
         requested &= ~(1ull << 3);
         value = (requested | __readmsr(IA32_VMX_CR0_FIXED0)) &
                 __readmsr(IA32_VMX_CR0_FIXED1);
-        (VOID)IntelVmWrite(VMCS_GUEST_CR0, value);
-        (VOID)IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
-        return TRUE;
+        status = IntelVmWrite(VMCS_GUEST_CR0, value);
+        if (NT_SUCCESS(status)) {
+            status = IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
+        }
+        return status;
     }
 
     if (access == 3 && cr == 0) {
-        if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &requested)) return FALSE;
+        if (!IntelVmReadValue(VMCS_CR0_READ_SHADOW, &requested)) {
+            return STATUS_HV_INVALID_VP_STATE;
+        }
         value = (qualification >> 16) & 0xffff;
         value = (requested & ~0xfull) | (value & 0xf);
         if ((requested & 1) != 0) value |= 1;
         requested = value;
         value = (requested | __readmsr(IA32_VMX_CR0_FIXED0)) &
                 __readmsr(IA32_VMX_CR0_FIXED1);
-        (VOID)IntelVmWrite(VMCS_GUEST_CR0, value);
-        (VOID)IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
-        return TRUE;
+        status = IntelVmWrite(VMCS_GUEST_CR0, value);
+        if (NT_SUCCESS(status)) {
+            status = IntelVmWrite(VMCS_CR0_READ_SHADOW, requested);
+        }
+        return status;
     }
-    return FALSE;
+    return STATUS_NOT_SUPPORTED;
 }
 
 static BOOLEAN
@@ -478,7 +561,9 @@ IntelVmExitHandler(
             MAXULONG, 0, 0);
     }
     context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
+#if JOHNSMITH_DIAGNOSTICS
     context->LastExitEntryTsc = __rdtsc();
+#endif
     if (__vmx_vmread(VMCS_EXIT_REASON, &value) != 0) {
         KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
             MAXULONG, 1, 0);
@@ -495,8 +580,10 @@ IntelVmExitHandler(
             reason, 3, 0);
     }
     guestRip = value;
+#if JOHNSMITH_DIAGNOSTICS
     IntelRecordExit(
         context, rawReason, reason, instructionLength, guestRip);
+#endif
     if ((rawReason & VMX_EXIT_REASON_ENTRY_FAILURE) != 0) {
         KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_UNEXPECTED_EXIT,
             Cpu->ProcessorIndex, rawReason, guestRip);
@@ -521,12 +608,29 @@ IntelVmExitHandler(
     }
 
     if (reason == VMX_EXIT_CPUID) {
-        __cpuidex(cpuid, (int)(ULONG)Registers->Rax,
-            (int)(ULONG)Registers->Rcx);
+        ULONG leaf = (ULONG)Registers->Rax;
+        ULONG subleaf = (ULONG)Registers->Rcx;
+
+        __cpuidex(cpuid, (int)leaf, (int)subleaf);
         Registers->Rax = (ULONG)cpuid[0];
         Registers->Rbx = (ULONG)cpuid[1];
         Registers->Rcx = (ULONG)cpuid[2];
         Registers->Rdx = (ULONG)cpuid[3];
+        if (leaf == 1) {
+            Registers->Rcx &= ~((1u << 5) | (1u << 31));
+        } else if (leaf == 7 && subleaf == 0 &&
+                   (context->SecondaryControls &
+                    VMX_SECONDARY_ENABLE_INVPCID) == 0) {
+            Registers->Rbx &= ~(1u << 10);
+        } else if (leaf == 0xDu && subleaf == 1 &&
+                   (context->SecondaryControls &
+                    VMX_SECONDARY_ENABLE_XSAVES) == 0) {
+            Registers->Rax &= ~(1u << 3);
+        } else if (leaf == 0x80000001u &&
+                   (context->SecondaryControls &
+                    VMX_SECONDARY_ENABLE_RDTSCP) == 0) {
+            Registers->Rdx &= ~(1u << 27);
+        }
         IntelAdvanceGuestRip(
             context, Cpu, reason, guestRip, instructionLength);
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
@@ -540,9 +644,11 @@ IntelVmExitHandler(
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 6, guestRip);
         }
-        if ((information & (1ull << 11)) != 0) {
-            (VOID)IntelVmReadValue(
-                VMCS_EXIT_INTERRUPTION_ERROR, &errorCode);
+        if ((information & (1ull << 11)) != 0 &&
+            !IntelVmReadValue(
+                VMCS_EXIT_INTERRUPTION_ERROR, &errorCode)) {
+            KeBugCheckEx(HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 12, guestRip);
         }
         information &= VMX_EVENT_INFORMATION_MASK;
         IntelInjectException(
@@ -556,7 +662,11 @@ IntelVmExitHandler(
     }
 
     if (reason == VMX_EXIT_CR_ACCESS) {
-        if (!IntelHandleCrAccess(Registers)) {
+        status = IntelHandleCrAccess(Registers, context);
+        if (NT_SUCCESS(status)) {
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
+        } else if (status == STATUS_NOT_SUPPORTED) {
             IntelInjectException(
                 VMX_ENTRY_INJECT_GP,
                 0,
@@ -565,8 +675,8 @@ IntelVmExitHandler(
                 reason,
                 guestRip);
         } else {
-            IntelAdvanceGuestRip(
-                context, Cpu, reason, guestRip, instructionLength);
+            KeBugCheckEx(HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 11, guestRip);
         }
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
@@ -575,14 +685,11 @@ IntelVmExitHandler(
         ULONG msr = (ULONG)Registers->Rcx;
         ULONG64 msrValue;
 
-        if (msr == IA32_FEATURE_CONTROL ||
-            (msr >= IA32_VMX_BASIC && msr <= IA32_VMX_EPT_VPID_CAP) ||
-            ((context->BackendContext != NULL) &&
-             ((((INTEL_BACKEND_CONTEXT*)context->BackendContext)->VmxBasic &
-               (1ull << 55)) != 0) &&
-             msr >= IA32_VMX_TRUE_PINBASED_CTLS &&
-             msr <= IA32_VMX_TRUE_ENTRY_CTLS)) {
+        if (msr == IA32_FEATURE_CONTROL) {
             msrValue = __readmsr(msr);
+            msrValue &= ~(IA32_FEATURE_CONTROL_VMX_IN_SMX |
+                          IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX);
+            msrValue |= 1;
             Registers->Rax = (ULONG)msrValue;
             Registers->Rdx = (ULONG)(msrValue >> 32);
             IntelAdvanceGuestRip(

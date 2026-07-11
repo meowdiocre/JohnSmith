@@ -30,6 +30,7 @@
 #define IA32_VMX_TRUE_PROCBASED_CTLS        0x0000048Eu
 #define IA32_VMX_TRUE_EXIT_CTLS             0x0000048Fu
 #define IA32_VMX_TRUE_ENTRY_CTLS            0x00000490u
+#define IA32_VMX_VMFUNC                     0x00000491u
 
 #define VMCS_VPID                           0x00000000u
 #define VMCS_GUEST_ES_SELECTOR              0x00000800u
@@ -48,8 +49,6 @@
 #define VMCS_HOST_GS_SELECTOR               0x00000C0Au
 #define VMCS_HOST_TR_SELECTOR               0x00000C0Cu
 
-#define VMCS_IO_BITMAP_A                    0x00002000u
-#define VMCS_IO_BITMAP_B                    0x00002002u
 #define VMCS_MSR_BITMAP                     0x00002004u
 #define VMCS_EPT_POINTER                    0x0000201Au
 #define VMCS_XSS_EXITING_BITMAP             0x0000202Cu
@@ -152,7 +151,6 @@
 #define VMCS_HOST_RIP                       0x00006C16u
 
 #define VMX_PRIMARY_ACTIVATE_SECONDARY      (1u << 31)
-#define VMX_PRIMARY_USE_IO_BITMAPS          (1u << 25)
 #define VMX_PRIMARY_USE_MSR_BITMAPS         (1u << 28)
 #define VMX_SECONDARY_ENABLE_EPT            (1u << 1)
 #define VMX_SECONDARY_ENABLE_RDTSCP         (1u << 3)
@@ -170,6 +168,13 @@
 #define VMX_CR4_VMXE                        (1ull << 13)
 #define CPUID_CET_SS                        (1u << 7)
 #define CPUID_CET_IBT                       (1u << 20)
+#define IA32_DEBUGCTL_BTF                    (1ull << 1)
+#define RFLAGS_TF                            (1ull << 8)
+#define VMX_GUEST_BLOCKING_BY_STI            (1ull << 0)
+#define VMX_GUEST_BLOCKING_BY_MOV_SS         (1ull << 1)
+#define VMX_PENDING_DEBUG_BS                 (1ull << 14)
+#define IA32_FEATURE_CONTROL_VMX_IN_SMX      (1ull << 1)
+#define IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX (1ull << 2)
 
 #define EPT_ACCESS_MASK                     0x7ull
 #define EPT_MEMORY_TYPE_SHIFT               3u

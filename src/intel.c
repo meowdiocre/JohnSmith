@@ -69,10 +69,10 @@ IntelInitializeMsrBitmap(
     ULONG msr;
 
     RtlZeroMemory(Bitmap, PAGE_SIZE);
-    IntelSetMsrBitmapBit(Bitmap, IA32_FEATURE_CONTROL, FALSE, TRUE);
+    IntelSetMsrBitmapBit(Bitmap, IA32_FEATURE_CONTROL, TRUE, TRUE);
     IntelSetMsrBitmapBit(Bitmap, IA32_S_CET, FALSE, TRUE);
-    for (msr = IA32_VMX_BASIC; msr <= 0x491u; ++msr) {
-        IntelSetMsrBitmapBit(Bitmap, msr, FALSE, TRUE);
+    for (msr = IA32_VMX_BASIC; msr <= IA32_VMX_VMFUNC; ++msr) {
+        IntelSetMsrBitmapBit(Bitmap, msr, TRUE, TRUE);
     }
 }
 
@@ -201,11 +201,8 @@ IntelPrepareCpu(
     context->HostStack = ExAllocatePool2(
         POOL_FLAG_NON_PAGED, INTEL_HOST_STACK_SIZE, HV_POOL_TAG_BACKEND);
     context->MsrBitmap = IntelAllocatePage(MAXULONG);
-    context->IoBitmapA = IntelAllocatePage(MAXULONG);
-    context->IoBitmapB = IntelAllocatePage(MAXULONG);
     if (context->Vmxon == NULL || context->Vmcs == NULL ||
-        context->HostStack == NULL || context->MsrBitmap == NULL ||
-        context->IoBitmapA == NULL || context->IoBitmapB == NULL) {
+        context->HostStack == NULL || context->MsrBitmap == NULL) {
         if (context->Vmxon != NULL) MmFreeContiguousMemory(context->Vmxon);
         if (context->Vmcs != NULL) MmFreeContiguousMemory(context->Vmcs);
         if (context->HostStack != NULL) {
@@ -214,12 +211,6 @@ IntelPrepareCpu(
         if (context->MsrBitmap != NULL) {
             MmFreeContiguousMemory(context->MsrBitmap);
         }
-        if (context->IoBitmapA != NULL) {
-            MmFreeContiguousMemory(context->IoBitmapA);
-        }
-        if (context->IoBitmapB != NULL) {
-            MmFreeContiguousMemory(context->IoBitmapB);
-        }
         ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -227,8 +218,6 @@ IntelPrepareCpu(
     context->VmxonPhysical = MmGetPhysicalAddress(context->Vmxon);
     context->VmcsPhysical = MmGetPhysicalAddress(context->Vmcs);
     context->MsrBitmapPhysical = MmGetPhysicalAddress(context->MsrBitmap);
-    context->IoBitmapAPhysical = MmGetPhysicalAddress(context->IoBitmapA);
-    context->IoBitmapBPhysical = MmGetPhysicalAddress(context->IoBitmapB);
     context->BackendContext = backend;
     context->SlatGeneration = backend->SlatGeneration;
     context->StopCookie = __rdtsc() ^ (ULONG64)context ^
@@ -256,12 +245,6 @@ IntelFreeCpu(
     if (context->HostStack != NULL) {
         RtlSecureZeroMemory(context->HostStack, INTEL_HOST_STACK_SIZE);
         ExFreePoolWithTag(context->HostStack, HV_POOL_TAG_BACKEND);
-    }
-    if (context->IoBitmapB != NULL) {
-        MmFreeContiguousMemory(context->IoBitmapB);
-    }
-    if (context->IoBitmapA != NULL) {
-        MmFreeContiguousMemory(context->IoBitmapA);
     }
     if (context->MsrBitmap != NULL) {
         MmFreeContiguousMemory(context->MsrBitmap);
@@ -365,6 +348,7 @@ IntelStart(
         return STATUS_INVALID_DEVICE_STATE;
     }
     context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
+    context->LastVmxError = 0;
     context->StartFailureStage = INTEL_START_STAGE_CET;
     status = IntelValidateSupervisorCet(NULL);
     if (!NT_SUCCESS(status)) {
