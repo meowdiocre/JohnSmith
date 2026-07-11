@@ -34,8 +34,6 @@ obj*/
 # Local agent metadata and bundled reference manuals
 .agents/
 .codex/
-Documentation/*.pdf
-static/docs/*.pdf
 
 # OS/editor noise
 .DS_Store

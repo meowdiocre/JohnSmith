@@ -8,7 +8,6 @@
 #define IA32_SYSENTER_EIP                   0x00000176u
 #define IA32_DEBUGCTL                       0x000001D9u
 #define IA32_PAT                            0x00000277u
-#define IA32_XSS                            0x00000DA0u
 #define IA32_EFER                           0xC0000080u
 #define IA32_FS_BASE                        0xC0000100u
 #define IA32_GS_BASE                        0xC0000101u
@@ -56,10 +55,9 @@
 #define VMCS_GUEST_DEBUGCTL                 0x00002802u
 #define VMCS_GUEST_PAT                      0x00002804u
 #define VMCS_GUEST_EFER                     0x00002806u
-#define VMCS_GUEST_XSS                      0x00002812u
+
 #define VMCS_HOST_PAT                       0x00002C00u
 #define VMCS_HOST_EFER                      0x00002C02u
-#define VMCS_HOST_XSS                       0x00002C06u
 
 #define VMCS_PIN_BASED_CONTROLS             0x00004000u
 #define VMCS_PRIMARY_PROCESSOR_CONTROLS     0x00004002u
@@ -1129,8 +1127,6 @@ IntelSetupVmcs(
     VMX_WRITE(VMCS_VPID, context->Vpid);
     if ((secondaryControls & VMX_SECONDARY_ENABLE_XSAVES) != 0) {
         VMX_WRITE(VMCS_XSS_EXITING_BITMAP, 0);
-        VMX_WRITE(VMCS_GUEST_XSS, __readmsr(IA32_XSS));
-        VMX_WRITE(VMCS_HOST_XSS, __readmsr(IA32_XSS));
     }
 
     VMX_WRITE(VMCS_GUEST_ES_SELECTOR, es.Selector);
