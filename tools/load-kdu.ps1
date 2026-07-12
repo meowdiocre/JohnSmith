@@ -88,23 +88,32 @@ function Invoke-KduDse {
     }
 }
 
-# --- DSE off -> load service -> DSE restored (always) ---
+# Remove an existing instance before invoking KDU. KDU providers may modify
+# CR0.WP; doing that under JohnSmith while CR4.CET is set is architecturally
+# invalid and can raise #GP before the provider restores its state.
+$svcReg = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+$existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existing -and $existing.Status -ne 'Stopped') {
+    Write-Host "Stopping existing '$ServiceName' instance before KDU..."
+    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    Start-Sleep -Seconds 1
+}
+& sc.exe delete $ServiceName 2>&1 | Out-Null
+for ($i = 0; $i -lt 20; $i++) {
+    if (-not (Test-Path -LiteralPath $svcReg)) { break }
+    Start-Sleep -Milliseconds 500
+}
+if (Test-Path -LiteralPath $svcReg) {
+    throw "Stale service key '$svcReg' could not be deleted. Close any open handles and re-run."
+}
+
+# --- DSE off -> load pending service -> DSE restored -> start VMX ---
 $dseTouched = $false
+$driverLoadedPending = $false
 try {
     Invoke-KduDse 0
     $dseTouched = $true
     Write-Host "DSE disabled (g_CiOptions = 0).`n"
-
-    $svcReg = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-    & sc.exe delete $ServiceName 2>&1 | Out-Null
-    for ($i = 0; $i -lt 20; $i++) {
-        if (-not (Test-Path -LiteralPath $svcReg)) { break }
-        Start-Sleep -Milliseconds 500
-    }
-    if (Test-Path -LiteralPath $svcReg) {
-        throw "Stale service key '$svcReg' could not be deleted. Close any open handles and re-run."
-    }
 
     $binPath = (Get-Item -LiteralPath $driver).FullName
     Write-Host "Creating service '$ServiceName' -> $binPath"
@@ -117,20 +126,22 @@ try {
     & sc.exe create @createArgs | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed (exit $LASTEXITCODE)." }
 
-    Write-Host "Starting service '$ServiceName'..."
+    # DriverEntry returns with VMX intentionally pending. This lets the KDU
+    # provider restore DSE while no JohnSmith hypervisor is active.
+    New-ItemProperty -LiteralPath $svcReg -Name StartRequested `
+        -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $svcReg -Name StartState `
+        -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $svcReg -Name StartStatus `
+        -PropertyType DWord -Value 0 -Force | Out-Null
+
+    Write-Host "Loading service '$ServiceName' with VMX start pending..."
     & sc.exe start $ServiceName
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "sc.exe start returned exit $LASTEXITCODE (DriverEntry may have failed)."
     }
 
-    Start-Sleep -Milliseconds 500
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq 'Running') {
-        Write-Host "`n[+] JohnSmith loaded and running as '$ServiceName'." -ForegroundColor Green
-    } else {
-        $state = if ($svc) { $svc.Status } else { '<gone>' }
-        Write-Warning "Service state is '$state'. DriverEntry may have failed; check kernel debugger."
-    }
+    $driverLoadedPending = $true
 }
 finally {
     if ($dseTouched) {
@@ -155,5 +166,28 @@ Manually fix it now:  & "$kduExe" -dse $target
 $_
 "@
         }
+    }
+}
+
+if ($driverLoadedPending) {
+    Write-Host "`nRequesting JohnSmith VMX start after DSE restoration..."
+    Set-ItemProperty -LiteralPath $svcReg -Name StartRequested `
+        -Type DWord -Value 1
+
+    $state = 0
+    for ($i = 0; $i -lt 300; $i++) {
+        $values = Get-ItemProperty -LiteralPath $svcReg
+        $state = [int]$values.StartState
+        if ($state -eq 2 -or $state -eq 3 -or $state -eq 4) { break }
+        Start-Sleep -Milliseconds 100
+    }
+
+    if ($state -eq 2) {
+        Write-Host "[+] JohnSmith loaded, DSE restored, and VMX is running." `
+            -ForegroundColor Green
+    } else {
+        $status = (Get-ItemProperty -LiteralPath $svcReg).StartStatus
+        throw ("JohnSmith deferred start failed: state={0}, NTSTATUS=0x{1:X8}." -f `
+            $state, [uint32]$status)
     }
 }

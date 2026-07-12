@@ -50,6 +50,14 @@ one-instruction blocking window. It also preserves pending debug causes and
 sets pending-debug `BS` when `RFLAGS.TF=1` and `IA32_DEBUGCTL.BTF=0`. Current
 emulated instructions have no guest data-memory operand, so comparing the new
 RIP against DR0-DR3 would incorrectly conflate execution and data breakpoints.
+The VM-exit save-debug-controls and VM-entry load-debug-controls controls keep
+guest DR7 and IA32_DEBUGCTL in the VMCS. VM exit sets root DR7 to `0x400` and
+clears IA32_DEBUGCTL, so root-mode register reads are not guest-state reads.
+
+VM exit also sets the GDTR and IDTR limits to `0xFFFF` (Section 30.5.2).
+Before VMXOFF, the stop path captures the current guest descriptor-table bases
+and limits; after VMXOFF, it restores them with LGDT and LIDT. Restoring only
+the bases, or using launch-time snapshots, leaves Windows with stale state.
 
 CPUID exits unconditionally in VMX non-root operation (Section 28.1.2).
 JohnSmith executes CPUID on the current logical processor for every exit because

@@ -81,6 +81,10 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG64 ResumeSysenterCs;
     ULONG64 ResumeSysenterEsp;
     ULONG64 ResumeSysenterEip;
+    ULONG64 ResumeGdtrBase;
+    ULONG64 ResumeIdtrBase;
+    ULONG64 ResumeGdtrLimit;
+    ULONG64 ResumeIdtrLimit;
     ULONG StartFailureStage;
     ULONG ControlFailureMask;
     ULONG PinControls;
@@ -148,3 +152,5 @@ USHORT IntelAsmReadLdtr(VOID);
 USHORT IntelAsmReadTr(VOID);
 VOID IntelAsmStoreGdtr(_Out_writes_bytes_(10) PVOID Register);
 VOID IntelAsmStoreIdtr(_Out_writes_bytes_(10) PVOID Register);
+VOID IntelAsmLoadGdtr(_In_reads_bytes_(10) const VOID* Register);
+VOID IntelAsmLoadIdtr(_In_reads_bytes_(10) const VOID* Register);

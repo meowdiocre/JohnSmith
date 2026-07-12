@@ -98,12 +98,12 @@ IntelSupport(
             supervisorCet);
         return status;
     }
-    if ((__readcr4() & HV_CR4_CET) != 0) {
-        HV_LOG_INFO(
-            "Intel CET facility is enabled with IA32_S_CET=0; "
-            "supervisor CET is inactive, continuing.\n");
-    }
-
+    // if ((__readcr4() & HV_CR4_CET) != 0) {
+    //     HV_LOG_INFO(
+    //         "Intel CET facility is enabled with IA32_S_CET=0; "
+    //         "supervisor CET is inactive, continuing.\n");
+    // }
+    
     __cpuid(registers, 1);
     if ((((ULONG)registers[2]) & (1u << 5)) == 0) {
         return STATUS_HV_FEATURE_UNAVAILABLE;
@@ -453,6 +453,8 @@ IntelStop(
     )
 {
     INTEL_CPU_CONTEXT* context;
+    INTEL_DESCRIPTOR_TABLE_REGISTER gdtr;
+    INTEL_DESCRIPTOR_TABLE_REGISTER idtr;
 
     UNREFERENCED_PARAMETER(State);
     if (!IntelCurrentCpuMatches(Cpu) || Cpu->VendorContext == NULL) {
@@ -467,6 +469,12 @@ IntelStop(
     if (context->Launched || context->VmxOn) {
         return STATUS_HV_OPERATION_FAILED;
     }
+    gdtr.Limit = (USHORT)context->ResumeGdtrLimit;
+    gdtr.Base = context->ResumeGdtrBase;
+    idtr.Limit = (USHORT)context->ResumeIdtrLimit;
+    idtr.Base = context->ResumeIdtrBase;
+    IntelAsmLoadGdtr(&gdtr);
+    IntelAsmLoadIdtr(&idtr);
     __writemsr(IA32_FS_BASE, context->ResumeFsBase);
     __writemsr(IA32_GS_BASE, context->ResumeGsBase);
     __writemsr(IA32_PAT, context->ResumePat);

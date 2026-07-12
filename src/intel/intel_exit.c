@@ -132,10 +132,6 @@ IntelRestoreVectoringEvent(
     *PendingInformation = 0;
     status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, 0);
     if (!NT_SUCCESS(status)) return status;
-    status = IntelVmWrite(VMCS_ENTRY_EXCEPTION_ERROR, 0);
-    if (!NT_SUCCESS(status)) return status;
-    status = IntelVmWrite(VMCS_ENTRY_INSTRUCTION_LENGTH, 0);
-    if (!NT_SUCCESS(status)) return status;
 
     if (!IntelVmReadValue(VMCS_IDT_VECTORING_INFO, &information)) {
         return STATUS_HV_INVALID_VP_STATE;
@@ -537,7 +533,15 @@ IntelCaptureStopState(
            IntelVmReadValue(
                VMCS_GUEST_SYSENTER_ESP, &Context->ResumeSysenterEsp) &&
            IntelVmReadValue(
-               VMCS_GUEST_SYSENTER_EIP, &Context->ResumeSysenterEip);
+               VMCS_GUEST_SYSENTER_EIP, &Context->ResumeSysenterEip) &&
+           IntelVmReadValue(
+               VMCS_GUEST_GDTR_BASE, &Context->ResumeGdtrBase) &&
+           IntelVmReadValue(
+               VMCS_GUEST_IDTR_BASE, &Context->ResumeIdtrBase) &&
+           IntelVmReadValue(
+               VMCS_GUEST_GDTR_LIMIT, &Context->ResumeGdtrLimit) &&
+           IntelVmReadValue(
+               VMCS_GUEST_IDTR_LIMIT, &Context->ResumeIdtrLimit);
 }
 
 ULONG

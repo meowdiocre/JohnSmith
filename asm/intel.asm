@@ -201,4 +201,14 @@ IntelAsmStoreIdtr PROC
     ret
 IntelAsmStoreIdtr ENDP
 
+IntelAsmLoadGdtr PROC
+    lgdt fword ptr [rcx]
+    ret
+IntelAsmLoadGdtr ENDP
+
+IntelAsmLoadIdtr PROC
+    lidt fword ptr [rcx]
+    ret
+IntelAsmLoadIdtr ENDP
+
 END

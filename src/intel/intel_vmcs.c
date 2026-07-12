@@ -185,10 +185,12 @@ IntelSetupVmcs(
         desiredPrimary, primaryMsr);
     secondaryControls = IntelAdjustControls(
         desiredSecondary, IA32_VMX_PROCBASED_CTLS2);
-    requiredExit = VMX_EXIT_HOST_ADDRESS_SPACE_SIZE |
+    requiredExit = VMX_EXIT_SAVE_DEBUG_CONTROLS |
+                   VMX_EXIT_HOST_ADDRESS_SPACE_SIZE |
                    VMX_EXIT_SAVE_PAT | VMX_EXIT_LOAD_PAT |
                    VMX_EXIT_SAVE_EFER | VMX_EXIT_LOAD_EFER;
-    requiredEntry = VMX_ENTRY_IA32E_MODE |
+    requiredEntry = VMX_ENTRY_LOAD_DEBUG_CONTROLS |
+                    VMX_ENTRY_IA32E_MODE |
                     VMX_ENTRY_LOAD_PAT | VMX_ENTRY_LOAD_EFER;
     exitControls = IntelAdjustControls(requiredExit, exitMsr);
     entryControls = IntelAdjustControls(requiredEntry, entryMsr);
