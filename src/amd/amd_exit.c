@@ -59,27 +59,6 @@ AmdIsPrivateHypercall(
            Registers->R8 == HV_HYPERCALL_MAGIC_R8;
 }
 
-static BOOLEAN
-AmdHandleXsetbv(
-    _In_ AMD_GUEST_REGISTERS* Registers,
-    _In_ AMD_VMCB* Vmcb
-    )
-{
-    ULONG64 requested;
-
-    if ((ULONG)Registers->Rcx != 0 || Vmcb->State.Cpl != 0 ||
-        (Vmcb->State.Cr4 & (1ull << 18)) == 0) {
-        return FALSE;
-    }
-    requested = ((ULONG64)(ULONG)Registers->Rdx << 32) |
-                (ULONG)Vmcb->State.Rax;
-    if (!HvX86IsValidXcr0(requested)) {
-        return FALSE;
-    }
-    _xsetbv(0, requested);
-    return TRUE;
-}
-
 ULONG
 AmdVmExitHandler(
     _Inout_ AMD_GUEST_REGISTERS* Registers,
@@ -143,8 +122,21 @@ AmdVmExitHandler(
                     (context->GuestEfer & (1ull << 10));
                 vmcb->State.Efer = context->GuestEfer | AMD_EFER_SVME;
             } else if (msr == AMD_MSR_VM_CR) {
+                if ((msrValue & ~0x1full) != 0) {
+                    AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
+                    return AMD_VMEXIT_RESUME;
+                }
+                if ((context->GuestVmCr & AMD_VM_CR_LOCK) != 0) {
+                    msrValue = (msrValue & ~AMD_VM_CR_LOCK_SVMDIS) |
+                               (context->GuestVmCr & AMD_VM_CR_LOCK_SVMDIS);
+                }
                 context->GuestVmCr = msrValue;
             } else if (msr == AMD_MSR_VM_HSAVE_PA) {
+                if ((msrValue & (PAGE_SIZE - 1)) != 0 ||
+                    msrValue >= HvX86GetPhysicalAddressLimit()) {
+                    AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
+                    return AMD_VMEXIT_RESUME;
+                }
                 context->GuestHostSavePhysical = msrValue;
             } else {
                 AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
@@ -171,12 +163,7 @@ AmdVmExitHandler(
     }
 
     if (exitCode == AMD_EXIT_XSETBV) {
-        if (AmdHandleXsetbv(Registers, vmcb)) {
-            vmcb->State.Rip = vmcb->Control.NextRip;
-            vmcb->Control.VmcbClean = 0;
-        } else {
-            AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
-        }
+        AmdInjectException(vmcb, Cpu, AMD_EVENT_INJECT_GP, 0);
         return AMD_VMEXIT_RESUME;
     }
 

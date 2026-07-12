@@ -28,6 +28,11 @@ HOST_FRAME_BACKEND_GENERATION EQU 16
 HOST_FRAME_CPUID_LEAF0        EQU 24
 HOST_FRAME_FAST_PATH_ENABLED  EQU 40
 
+; INTEL_CPU_CONTEXT layout consumed by this file.  Compile-time asserts in
+; include/intel.h keep the offsets in sync.
+HV_CPU_VENDOR_CONTEXT         EQU 16
+CPU_CONTEXT_GUEST_CR2         EQU 72
+
 IFNDEF JOHNSMITH_VMEXIT_BENCHMARK
 JOHNSMITH_VMEXIT_BENCHMARK EQU 0
 ENDIF
@@ -236,6 +241,19 @@ IntelVmExitSlowPath:
     pop r9
     pop r8
 
+    ; Snapshot guest CR2 before any host code path can fault and clobber it.
+    ; VMX does not save or restore CR2, so host CR2 == guest CR2 on VM exit
+    ; and stays that way until we run something that faults.  Fast path never
+    ; touches CR2 and skips this save/restore.
+    push rax
+    push rcx
+    mov rcx, qword ptr [rsp + 16]                ; host frame: HV_CPU*
+    mov rcx, qword ptr [rcx + HV_CPU_VENDOR_CONTEXT]
+    mov rax, cr2
+    mov qword ptr [rcx + CPU_CONTEXT_GUEST_CR2], rax
+    pop rcx
+    pop rax
+
     ; Ascending frame offsets are RAX, RCX, RDX, RBX, RBP, RSI, RDI,
     ; R8..R15.  VMCS host RSP points at the owning HV_CPU pointer.
     push r15
@@ -277,6 +295,15 @@ IntelVmExitSlowPath:
     movdqu xmm4, xmmword ptr [rsp + 64]
     movdqu xmm5, xmmword ptr [rsp + 80]
     add rsp, 96
+
+    ; Restore guest CR2.  Handler may have overwritten context->GuestCr2 to
+    ; inject a #PF; if not, the value flows back unchanged.  Both the
+    ; resume and shutdown exits go through here.
+    mov r10, qword ptr [rsp + 120]               ; host frame: HV_CPU*
+    mov r10, qword ptr [r10 + HV_CPU_VENDOR_CONTEXT]
+    mov r10, qword ptr [r10 + CPU_CONTEXT_GUEST_CR2]
+    mov cr2, r10
+
     cmp eax, 1
     je IntelShutdown
 

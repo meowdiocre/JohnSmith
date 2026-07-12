@@ -81,6 +81,9 @@
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <Optimization>Disabled</Optimization>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <MASM>
       <IncludePaths>$(ProjectDir)include;%(IncludePaths)</IncludePaths>
       <PreprocessorDefinitions>JOHNSMITH_VMEXIT_BENCHMARK=$(JohnSmithVmexitBenchmark);%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -101,6 +104,9 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <MASM>
       <IncludePaths>$(ProjectDir)include;%(IncludePaths)</IncludePaths>
       <PreprocessorDefinitions>JOHNSMITH_VMEXIT_BENCHMARK=$(JohnSmithVmexitBenchmark);%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -121,6 +127,9 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <MASM>
       <IncludePaths>$(ProjectDir)include;%(IncludePaths)</IncludePaths>
       <PreprocessorDefinitions>JOHNSMITH_VMEXIT_BENCHMARK=$(JohnSmithVmexitBenchmark);%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -131,11 +140,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\common\x86_common.c" />
+    <ClCompile Include="src\device.c" />
     <ClCompile Include="src\driver.c" />
     <ClCompile Include="src\hv.c" />
     <ClCompile Include="src\log.c" />
     <ClCompile Include="src\intel.c" />
     <ClCompile Include="src\intel\intel_exit.c" />
+    <ClCompile Include="src\intel\intel_hook.c" />
     <ClCompile Include="src\intel\intel_slat.c" />
     <ClCompile Include="src\intel\intel_vmcs.c" />
     <ClCompile Include="src\amd.c" />
@@ -145,8 +156,10 @@
     <ClCompile Include="src\introspection.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\device.h" />
     <ClInclude Include="include\hv.h" />
     <ClInclude Include="include\hv_log.h" />
+    <ClInclude Include="include\johnsmith_ioctl.h" />
     <ClInclude Include="src\common\x86_common.h" />
     <ClInclude Include="include\intel.h" />
     <ClInclude Include="src\intel\intel_internal.h" />

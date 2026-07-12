@@ -131,10 +131,67 @@ UC. Mixed 2 MiB regions are split into 4 KiB PTEs. EPT violations and EPT
 misconfigurations are distinct fail-stop conditions; an EPT violation is not a
 guest page fault.
 
+Every 4 KiB split records the reason it was created:
+
+- `INTEL_SPLIT_REASON_MIXED_MEMORY_MAP` for boot-time RAM/MMIO splits. These
+  carry heterogeneous memory types and are never eligible for merge because a
+  single 2 MiB leaf cannot represent both WB and UC coverage.
+- `INTEL_SPLIT_REASON_PERMISSION` for runtime per-page permission changes.
+  These are the only splits eligible for merge, and only when all 512 PTEs
+  return to identical address, permission, and memory-type attributes.
+- `INTEL_SPLIT_REASON_HOOK` for splits that back a Stage 4 hook. These are
+  never eligible for merge while the split exists; the merge helper refuses
+  to collapse them even after the PTEs are restored on remove, at the cost
+  of holding one 4 KiB PT per hooked 2 MiB region until backend teardown.
+
+An EPT violation decoder converts the exit qualification into read/write/execute
+access intent, EPT-visible readable/writable/executable state, and
+linear-address validity. The linear address is consumed only when qualification
+bit 7 is set. The current handler consults the hook policy table before any
+fail-stop, so a synthetic guest `#PF` is never fabricated without a validated
+policy and per-vCPU CR2 virtualization in place.
+
+### Dual-EPT hook views
+
+Hook installation attaches a second `INTEL_EPT_ROOT` (`HookRoot`) to the
+backend, allocated lazily on the first install and freed at backend teardown.
+The hook root is a deep-copy identity mapping with R+W permissions on every
+RAM leaf; execute is stripped so that any instruction fetch inside the hook
+view that leaves the shadow page produces an EPT violation the hypervisor can
+steer back to the primary view.
+
+For each installed hook:
+
+- the primary root's 4 KiB PTE is rewritten from RWX to R+W with the memory
+  type preserved, so data reads and writes still see the original bytes but
+  fetches trap;
+- the hook root's 4 KiB PTE is rewritten to X-only pointing at a fresh
+  cached shadow page whose contents are a copy of the original page with the
+  caller-supplied patch bytes applied.
+
+The EPT-violation handler serves three transitions:
+
+- execute violation on a hooked GPA from the primary root switches to the
+  hook root and retries without advancing RIP; the guest fetches the patched
+  bytes;
+- data violation on a hooked GPA from the hook root switches back to the
+  primary root and retries; the guest reads or writes the original bytes;
+- execute violation on the hook root outside any hooked GPA switches back to
+  the primary root and retries; control has left the shadow page and belongs
+  on the original view again.
+
+Any policy match that reaches an unswitchable state fail-stops with
+`INTEL_BUGCHECK_EPT_VIOLATION` carrying `(Cookie, Kind)` in bugcheck
+parameter 4. Execute-only leaves require `IA32_VMX_EPT_VPID_CAP[0]`;
+installation refuses to run when that bit is clear.
+
 Each pinned CPU receives a nonzero processor-local VPID when supported. Live
 EPT changes increment a shared generation and rendezvous every active CPU.
 Each CPU performs single-context INVEPT when supported, otherwise all-context
-INVEPT, before accepting the new generation.
+INVEPT, before accepting the new generation. `IntelSwitchActiveEptRoot`
+writes `VMCS_EPT_POINTER`, updates the vCPU's cached `EptPointer`, resets its
+generation counter to force mismatch on the next check, and then invokes the
+same INVEPT path so the newly-loaded root sees no stale translations.
 
 ## MSR and nested-VMX policy
 
@@ -150,8 +207,19 @@ PAT, EFER, SYSENTER, FS, and GS state. VM exit sets GDTR/IDTR limits to `0xFFFF`
 (Section 30.5.2), so both bases and limits are restored after VMXOFF.
 
 Debug builds retain a bounded per-CPU exit history. Unexpected exit, event
-collision, EPT violation, and invalidation failures use distinct bugcheck
-signatures. Release builds remove history collection from the hot path.
+collision, EPT violation, EPT misconfiguration, and invalidation failures use
+distinct bugcheck signatures. Release builds remove history collection from
+the hot path.
+
+## Control device
+
+`\Device\JohnSmith` and `\DosDevices\JohnSmith` provide a versioned IOCTL
+surface for offline inspection. The device ACL grants read/write access to
+SYSTEM and BUILTIN\\Administrators only. `IOCTL_JOHNSMITH_STATUS` returns the
+lifecycle, backend name, prepared and running CPU counts, and the ABI version
+from `include/johnsmith_ioctl.h`. Hook and physical-memory IOCTLs are
+intentionally deferred until the multi-EPT-root refactor (Stage 4) is in
+place.
 
 ## Deliberate exclusions
 

@@ -107,7 +107,7 @@ IntelSupport(
     //         "Intel CET facility is enabled with IA32_S_CET=0; "
     //         "supervisor CET is inactive, continuing.\n");
     // }
-    
+
     __cpuid(registers, 1);
     if ((((ULONG)registers[2]) & (1u << 5)) == 0) {
         return STATUS_HV_FEATURE_UNAVAILABLE;
@@ -149,10 +149,11 @@ IntelPrepare(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(context, sizeof(*context));
-    InitializeListHead(&context->SplitList);
     context->VmxBasic = __readmsr(IA32_VMX_BASIC);
     context->EptVpidCapabilities = __readmsr(IA32_VMX_EPT_VPID_CAP);
     context->SlatGeneration = 1;
+    /* No hooks after prepare; secondary root is created lazily. */
+    IntelHookResetTable();
     State->BackendContext = context;
 
     status = IntelBuildEpt(context);
@@ -176,6 +177,7 @@ IntelFree(
     }
     context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
     IntelFreeEpt(context);
+    IntelHookResetTable();
     ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
     State->BackendContext = NULL;
 }
@@ -513,7 +515,10 @@ static const HV_BACKEND_OPS IntelBackendOps = {
     IntelStop,
     IntelReportStartFailure,
     IntelQueryOwnedPageAccess,
-    IntelSetOwnedPageAccess
+    IntelSetOwnedPageAccess,
+    IntelHookInstall,
+    IntelHookRemove,
+    IntelHookQuery
 };
 
 const HV_BACKEND_OPS*

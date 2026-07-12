@@ -21,12 +21,15 @@
 #define AMD_MSR_VM_HSAVE_PA             0xC0010117u
 
 #define AMD_EFER_SVME                   (1ull << 12)
+#define AMD_VM_CR_LOCK                  (1ull << 3)
 #define AMD_VM_CR_SVMDIS                (1ull << 4)
+#define AMD_VM_CR_LOCK_SVMDIS           (AMD_VM_CR_LOCK | AMD_VM_CR_SVMDIS)
 
 #define AMD_SVM_FEATURE_NPT             (1u << 0)
 #define AMD_SVM_FEATURE_NRIPS           (1u << 3)
 #define AMD_SVM_FEATURE_FLUSH_BY_ASID   (1u << 6)
 
+#define AMD_INTERCEPT_CPUID             (1u << 18)
 #define AMD_INTERCEPT_INVLPGA           (1u << 26)
 #define AMD_INTERCEPT_MSR               (1u << 28)
 #define AMD_INTERCEPT_SVM_INSTRUCTIONS  0x7fu

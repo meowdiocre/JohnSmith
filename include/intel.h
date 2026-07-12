@@ -73,6 +73,8 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG64 OriginalCr4;
     ULONG64 ResumeRsp;
     ULONG64 ResumeRip;
+
+    ULONG64 GuestCr2;
     BOOLEAN VmxOn;
     BOOLEAN Launched;
     PVOID MsrBitmap;
@@ -121,6 +123,10 @@ typedef struct _INTEL_CPU_CONTEXT {
     volatile LONG64 CompletedExitSequence;
     ULONG64 LastExitEntryTsc;
     ULONG64 LastExitCompletionTsc;
+
+    volatile LONG PendingNmi;
+    volatile LONG PendingInterruptValid;
+    UCHAR PendingInterruptVector;
     INTEL_EXIT_RECORD ExitHistory[INTEL_EXIT_HISTORY_COUNT];
 } INTEL_CPU_CONTEXT;
 
@@ -133,6 +139,7 @@ C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, CpuidLeaf0Eax) == 24);
 C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, FastPathEnabled) == 40);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRsp) == 56);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRip) == 64);
+C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, GuestCr2) == 72);
 C_ASSERT((INTEL_EXIT_HISTORY_COUNT & (INTEL_EXIT_HISTORY_COUNT - 1)) == 0);
 C_ASSERT(sizeof(INTEL_EXIT_RECORD) == 64);
 C_ASSERT((FIELD_OFFSET(INTEL_CPU_CONTEXT, ExitSequence) & 7) == 0);

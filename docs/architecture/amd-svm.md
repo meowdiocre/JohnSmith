@@ -28,13 +28,15 @@ descriptor state. The backend enables:
 
 - nested paging;
 - MSR permission-map interception;
+- CPUID interception for the feature-hiding policy;
 - INVLPGA interception;
 - SVM-instruction interception;
-- XSETBV interception when XSAVE is present.
+- XSETBV interception when XSAVE is present; requests currently receive `#GP` until guest XCR0 and host XCR0 are preserved separately.
 
-CPUID interception is deliberately clear. AMD CPUID therefore retires in guest
-mode without a VM exit, and the backend does not advertise a CPUID masking
-policy.
+CPUID exits and is emulated with native results followed by the project policy:
+leaf 1 hides the hypervisor-present bit, leaf `0x80000001` hides SVM, and SVM
+capability leaf `0x8000000A` returns zero. Dynamic leaves still execute native
+CPUID for each request.
 
 I/O interception is disabled until the project owns an explicit port policy.
 An allocated all-zero IOPM would add state without changing behavior.
@@ -91,9 +93,10 @@ an event already selected for `EVENTINJ` and a new exception is a fail-stop
 condition.
 
 MSRPM policy virtualizes EFER, VM_CR, and VM_HSAVE_PA while rejecting unsupported
-intercepted accesses with `#GP`. Guest SVM instructions and INVLPGA receive
-`#UD`; nested SVM is not implemented. XSETBV shares the architecture validation
-used by Intel and advances only on success.
+intercepted accesses with `#GP`. VM_CR writes enforce reserved-bit and LOCK/SVMDIS
+semantics; VM_HSAVE_PA writes enforce alignment and physical-width constraints.
+Guest SVM instructions and INVLPGA receive `#UD`; nested SVM is not implemented.
+XSETBV receives `#GP` until transition code owns separate host and guest XCR0.
 
 ## Host state and teardown
 
@@ -113,7 +116,7 @@ enumeration, and processor errata.
 
 ## Deliberate exclusions
 
-- Native AMD CPUID is not masked.
+- Nested SVM is hidden rather than virtualized.
 - I/O virtualization and a device model are absent.
 - AMD CET/SSP state virtualization is absent.
 - Recoverable NPF emulation and nested SVM are absent.

@@ -70,25 +70,180 @@ IntelInvalidateRunningSlat(
     }
 }
 
-static PVOID
-IntelFindSplitPt(
-    _In_ INTEL_BACKEND_CONTEXT* Context,
+VOID
+IntelHookInvalidateEverywhere(
+    _Inout_ HV_STATE* State,
+    _Inout_ INTEL_BACKEND_CONTEXT* Backend
+    )
+{
+
+    if (InterlockedCompareExchange(&State->Lifecycle, 0, 0) !=
+        HV_LIFECYCLE_RUNNING) {
+        return;
+    }
+    IntelInvalidateRunningSlat(State, Backend);
+}
+
+static INTEL_SLAT_SPLIT*
+IntelFindSplit(
+    _In_ INTEL_EPT_ROOT* Root,
     _In_ ULONG PdptIndex,
     _In_ ULONG PdIndex
     )
 {
     PLIST_ENTRY entry;
 
-    for (entry = Context->SplitList.Flink;
-         entry != &Context->SplitList;
+    for (entry = Root->SplitList.Flink;
+         entry != &Root->SplitList;
          entry = entry->Flink) {
         INTEL_SLAT_SPLIT* split = CONTAINING_RECORD(
             entry, INTEL_SLAT_SPLIT, Link);
         if (split->PdptIndex == PdptIndex && split->PdIndex == PdIndex) {
-            return split->Pt;
+            return split;
         }
     }
     return NULL;
+}
+
+static PVOID
+IntelFindSplitPt(
+    _In_ INTEL_EPT_ROOT* Root,
+    _In_ ULONG PdptIndex,
+    _In_ ULONG PdIndex
+    )
+{
+    INTEL_SLAT_SPLIT* split = IntelFindSplit(Root, PdptIndex, PdIndex);
+
+    return split == NULL ? NULL : split->Pt;
+}
+
+/* Caller holds Root->SlatLock exclusively. */
+_Success_(return != FALSE)
+static BOOLEAN
+IntelCanMerge2MbLocked(
+    _In_ const ULONG64* Pt,
+    _Out_ ULONG64* LargeEntry
+    )
+{
+    ULONG64 attributes;
+    ULONG64 base;
+    ULONG index;
+
+    *LargeEntry = 0;
+    base = Pt[0] & EPT_ADDRESS_MASK;
+    attributes = Pt[0] & (EPT_ACCESS_MASK | EPT_MEMORY_TYPE_MASK);
+    if ((base & ((1ull << 21) - 1)) != 0) {
+        return FALSE;
+    }
+
+    for (index = 0; index < 512; ++index) {
+        ULONG64 expectedAddress = base + ((ULONG64)index << PAGE_SHIFT);
+        ULONG64 entry = Pt[index];
+
+        if ((entry & EPT_ADDRESS_MASK) != expectedAddress ||
+            (entry & (EPT_ACCESS_MASK | EPT_MEMORY_TYPE_MASK)) != attributes ||
+            (entry & ~(EPT_ADDRESS_MASK | EPT_ACCESS_MASK |
+                       EPT_MEMORY_TYPE_MASK)) != 0) {
+            return FALSE;
+        }
+    }
+
+    *LargeEntry = (base & EPT_2MB_ADDRESS_MASK) |
+                  attributes | EPT_LARGE_PAGE;
+    return TRUE;
+}
+
+/* Caller holds Root->SlatLock exclusively. */
+static INTEL_SLAT_SPLIT*
+IntelTryMerge2MbLocked(
+    _Inout_ INTEL_EPT_ROOT* Root,
+    _In_ ULONG PdptIndex,
+    _In_ ULONG PdIndex
+    )
+{
+    INTEL_SLAT_SPLIT* split;
+    ULONG64 largeEntry;
+    ULONG64* pd;
+
+    split = IntelFindSplit(Root, PdptIndex, PdIndex);
+
+    if (split == NULL ||
+        split->Reason != INTEL_SPLIT_REASON_PERMISSION ||
+        !IntelCanMerge2MbLocked((const ULONG64*)split->Pt, &largeEntry)) {
+        return NULL;
+    }
+
+    pd = (ULONG64*)Root->Pds[PdptIndex];
+    RemoveEntryList(&split->Link);
+    KeMemoryBarrier();
+    InterlockedExchange64(
+        (volatile LONG64*)&pd[PdIndex], (LONG64)largeEntry);
+    return split;
+}
+
+static VOID
+IntelFreeRetiredSplit(
+    _In_opt_ INTEL_SLAT_SPLIT* Split
+    )
+{
+    if (Split != NULL) {
+        MmFreeContiguousMemory(Split->Pt);
+        ExFreePoolWithTag(Split, HV_POOL_TAG_SLAT_SPLIT);
+    }
+}
+
+static NTSTATUS
+IntelSplit2MbLocked(
+    _Inout_ INTEL_EPT_ROOT* Root,
+    _In_ ULONG PdptIndex,
+    _In_ ULONG PdIndex,
+    _Outptr_ ULONG64** Pt
+    )
+{
+    INTEL_SLAT_SPLIT* split;
+    ULONG64* pd;
+    ULONG64 pde;
+    ULONG64 leafAttributes;
+    ULONG index;
+
+    *Pt = NULL;
+    pd = (ULONG64*)Root->Pds[PdptIndex];
+    pde = pd[PdIndex];
+    if ((pde & EPT_LARGE_PAGE) == 0) {
+        *Pt = (ULONG64*)IntelFindSplitPt(Root, PdptIndex, PdIndex);
+        return *Pt == NULL ? STATUS_DATA_ERROR : STATUS_SUCCESS;
+    }
+
+    split = (INTEL_SLAT_SPLIT*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*split), HV_POOL_TAG_SLAT_SPLIT);
+    if (split == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(split, sizeof(*split));
+    split->Pt = IntelAllocatePage(MAXLONGLONG);
+    if (split->Pt == NULL) {
+        ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    leafAttributes = pde & (EPT_ACCESS_MASK | EPT_MEMORY_TYPE_MASK);
+    *Pt = (ULONG64*)split->Pt;
+    for (index = 0; index < 512; ++index) {
+        (*Pt)[index] = (pde & EPT_2MB_ADDRESS_MASK) |
+                       ((ULONG64)index << PAGE_SHIFT) |
+                       leafAttributes;
+    }
+
+    split->PdptIndex = PdptIndex;
+    split->PdIndex = PdIndex;
+    split->Reason = INTEL_SPLIT_REASON_PERMISSION;
+    InsertTailList(&Root->SplitList, &split->Link);
+    KeMemoryBarrier();
+    InterlockedExchange64(
+        (volatile LONG64*)&pd[PdIndex],
+        (LONG64)(((ULONG64)MmGetPhysicalAddress(*Pt).QuadPart &
+                  EPT_ADDRESS_MASK) | EPT_ACCESS_MASK));
+    return STATUS_SUCCESS;
 }
 
 PVOID
@@ -114,7 +269,7 @@ IntelAllocatePage(
 
 static NTSTATUS
 IntelCreateMixedMapping(
-    _Inout_ INTEL_BACKEND_CONTEXT* Context,
+    _Inout_ INTEL_EPT_ROOT* Root,
     _In_ PPHYSICAL_MEMORY_RANGE Ranges,
     _In_ ULONG PdptIndex,
     _In_ ULONG PdIndex,
@@ -152,15 +307,18 @@ IntelCreateMixedMapping(
 
     split->PdptIndex = PdptIndex;
     split->PdIndex = PdIndex;
-    InsertTailList(&Context->SplitList, &split->Link);
+    split->Reason = INTEL_SPLIT_REASON_MIXED_MEMORY_MAP;
+    InsertTailList(&Root->SplitList, &split->Link);
     *Entry = ((ULONG64)MmGetPhysicalAddress(pt).QuadPart &
               EPT_ADDRESS_MASK) | EPT_ACCESS_MASK;
     return STATUS_SUCCESS;
 }
 
 NTSTATUS
-IntelBuildEpt(
-    _Inout_ INTEL_BACKEND_CONTEXT* Context
+IntelBuildIdentityRoot(
+    _Inout_ INTEL_BACKEND_CONTEXT* Backend,
+    _Inout_ INTEL_EPT_ROOT* Root,
+    _In_ HV_PAGE_ACCESS LeafAccess
     )
 {
     PPHYSICAL_MEMORY_RANGE ranges;
@@ -169,40 +327,41 @@ IntelBuildEpt(
     ULONG pdIndex;
     ULONG64* pml4;
     ULONG64* pdpt;
+    ULONG64 leafAccessBits;
 
-    Context->MapLimit = HvX86GetSlatMapLimit();
-    if (Context->MapLimit < (1ull << 32)) {
-        return STATUS_HV_FEATURE_UNAVAILABLE;
+    leafAccessBits = ((ULONG64)LeafAccess) & EPT_ACCESS_MASK;
+    if (leafAccessBits == 0) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    Context->Pml4 = IntelAllocatePage(MAXLONGLONG);
-    Context->Pdpt = IntelAllocatePage(MAXLONGLONG);
-    if (Context->Pml4 == NULL || Context->Pdpt == NULL) {
+    InitializeListHead(&Root->SplitList);
+    /* SlatLock zero-initialization gives the correct initial pushlock state. */
+    Root->Pml4 = IntelAllocatePage(MAXLONGLONG);
+    Root->Pdpt = IntelAllocatePage(MAXLONGLONG);
+    if (Root->Pml4 == NULL || Root->Pdpt == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    pml4 = (ULONG64*)Context->Pml4;
-    pdpt = (ULONG64*)Context->Pdpt;
-    pml4[0] = ((ULONG64)MmGetPhysicalAddress(Context->Pdpt).QuadPart &
+    pml4 = (ULONG64*)Root->Pml4;
+    pdpt = (ULONG64*)Root->Pdpt;
+    pml4[0] = ((ULONG64)MmGetPhysicalAddress(Root->Pdpt).QuadPart &
                EPT_ADDRESS_MASK) | EPT_ACCESS_MASK;
 
     ranges = MmGetPhysicalMemoryRangesEx2(NULL, 0);
     if (ranges == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    pdptCount = (ULONG)((Context->MapLimit + ((1ull << 30) - 1)) >> 30);
+    pdptCount = (ULONG)((Backend->MapLimit + ((1ull << 30) - 1)) >> 30);
     for (pdptIndex = 0; pdptIndex < pdptCount; ++pdptIndex) {
         ULONG64* pd;
 
-        Context->Pds[pdptIndex] = IntelAllocatePage(MAXLONGLONG);
-        if (Context->Pds[pdptIndex] == NULL) {
-            if (ranges != NULL) {
-                ExFreePool(ranges);
-            }
+        Root->Pds[pdptIndex] = IntelAllocatePage(MAXLONGLONG);
+        if (Root->Pds[pdptIndex] == NULL) {
+            ExFreePool(ranges);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        pd = (ULONG64*)Context->Pds[pdptIndex];
+        pd = (ULONG64*)Root->Pds[pdptIndex];
         pdpt[pdptIndex] =
             ((ULONG64)MmGetPhysicalAddress(pd).QuadPart & EPT_ADDRESS_MASK) |
             EPT_ACCESS_MASK;
@@ -212,43 +371,53 @@ IntelBuildEpt(
                                ((ULONG64)pdIndex << 21);
             NTSTATUS status;
 
-            if (physical >= Context->MapLimit) {
+            if (physical >= Backend->MapLimit) {
                 break;
             }
             if (HvX86RangeIsRam(ranges, physical, 1ull << 21)) {
                 pd[pdIndex] = (physical & EPT_2MB_ADDRESS_MASK) |
-                              EPT_ACCESS_MASK |
+                              leafAccessBits |
                               EPT_LARGE_PAGE |
                               (EPT_MEMORY_TYPE_WB <<
                                EPT_MEMORY_TYPE_SHIFT);
             } else if (HvX86RangeIntersectsRam(
                            ranges, physical, 1ull << 21)) {
                 status = IntelCreateMixedMapping(
-                    Context, ranges, pdptIndex, pdIndex,
+                    Root, ranges, pdptIndex, pdIndex,
                     physical, &pd[pdIndex]);
                 if (!NT_SUCCESS(status)) {
                     ExFreePool(ranges);
                     return status;
                 }
             } else {
+                /* Non-RAM keeps identity mapping but with UC memory type;
+                   permissions still follow the requested leaf mask so the
+                   secondary root does not accidentally leave MMIO
+                   executable to the guest. */
                 pd[pdIndex] = (physical & EPT_2MB_ADDRESS_MASK) |
-                              EPT_ACCESS_MASK |
+                              leafAccessBits |
                               EPT_LARGE_PAGE;
             }
         }
     }
 
     ExFreePool(ranges);
+
+    Root->EptPointer = ((ULONG64)MmGetPhysicalAddress(Root->Pml4).QuadPart &
+                        EPT_ADDRESS_MASK) |
+                       EPT_MEMORY_TYPE_WB | (3ull << 3);
     return STATUS_SUCCESS;
 }
 
 VOID
-IntelFreeEpt(
-    _Inout_ INTEL_BACKEND_CONTEXT* Context
+IntelFreeRoot(
+    _Inout_ INTEL_EPT_ROOT* Root
     )
 {
-    while (!IsListEmpty(&Context->SplitList)) {
-        PLIST_ENTRY entry = RemoveHeadList(&Context->SplitList);
+    ULONG index;
+
+    while (!IsListEmpty(&Root->SplitList)) {
+        PLIST_ENTRY entry = RemoveHeadList(&Root->SplitList);
         INTEL_SLAT_SPLIT* split = CONTAINING_RECORD(
             entry, INTEL_SLAT_SPLIT, Link);
 
@@ -256,20 +425,129 @@ IntelFreeEpt(
         ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
     }
 
-    for (ULONG index = 0; index < RTL_NUMBER_OF(Context->Pds); ++index) {
-        if (Context->Pds[index] != NULL) {
-            MmFreeContiguousMemory(Context->Pds[index]);
-            Context->Pds[index] = NULL;
+    for (index = 0; index < RTL_NUMBER_OF(Root->Pds); ++index) {
+        if (Root->Pds[index] != NULL) {
+            MmFreeContiguousMemory(Root->Pds[index]);
+            Root->Pds[index] = NULL;
         }
     }
-    if (Context->Pdpt != NULL) {
-        MmFreeContiguousMemory(Context->Pdpt);
-        Context->Pdpt = NULL;
+    if (Root->Pdpt != NULL) {
+        MmFreeContiguousMemory(Root->Pdpt);
+        Root->Pdpt = NULL;
     }
-    if (Context->Pml4 != NULL) {
-        MmFreeContiguousMemory(Context->Pml4);
-        Context->Pml4 = NULL;
+    if (Root->Pml4 != NULL) {
+        MmFreeContiguousMemory(Root->Pml4);
+        Root->Pml4 = NULL;
     }
+    Root->EptPointer = 0;
+}
+
+NTSTATUS
+IntelBuildEpt(
+    _Inout_ INTEL_BACKEND_CONTEXT* Context
+    )
+{
+    Context->MapLimit = HvX86GetSlatMapLimit();
+    if (Context->MapLimit < (1ull << 32)) {
+        return STATUS_HV_FEATURE_UNAVAILABLE;
+    }
+
+    RtlZeroMemory(&Context->PrimaryRoot, sizeof(Context->PrimaryRoot));
+    return IntelBuildIdentityRoot(
+        Context, &Context->PrimaryRoot,
+        HV_PAGE_ACCESS_READ | HV_PAGE_ACCESS_WRITE | HV_PAGE_ACCESS_EXECUTE);
+}
+
+VOID
+IntelFreeEpt(
+    _Inout_ INTEL_BACKEND_CONTEXT* Context
+    )
+{
+    IntelFreeRoot(&Context->PrimaryRoot);
+    if (Context->HookRoot != NULL) {
+        IntelFreeRoot(Context->HookRoot);
+        ExFreePoolWithTag(Context->HookRoot, HV_POOL_TAG_BACKEND);
+        Context->HookRoot = NULL;
+    }
+}
+
+NTSTATUS
+IntelSwitchActiveEptRoot(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_EPT_ROOT* Root
+    )
+{
+    NTSTATUS status;
+
+    if (Context == NULL || Root == NULL || Root->EptPointer == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Root->EptPointer == Context->EptPointer) {
+        return STATUS_SUCCESS;
+    }
+
+    status = IntelVmWrite(VMCS_EPT_POINTER, Root->EptPointer);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    Context->EptPointer = Root->EptPointer;
+    Context->SlatGeneration = 0;
+    IntelFlushEptIfNeeded(Context);
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IntelHookAcquirePt(
+    _Inout_ INTEL_EPT_ROOT* Root,
+    _In_ ULONG64 MapLimit,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _In_ INTEL_SPLIT_REASON NewSplitReason,
+    _Outptr_ ULONG64** Pt,
+    _Out_ ULONG* PtIndex
+    )
+{
+    ULONG pdptIndex;
+    ULONG pdIndex;
+    NTSTATUS status;
+
+    *Pt = NULL;
+    *PtIndex = 0;
+    if (GuestPhysicalAddress >= MapLimit ||
+        GuestPhysicalAddress >= HV_SLAT_MAXIMUM_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    pdptIndex = (ULONG)(GuestPhysicalAddress >> 30);
+    pdIndex = (ULONG)((GuestPhysicalAddress >> 21) & 0x1ff);
+    *PtIndex = (ULONG)((GuestPhysicalAddress >> 12) & 0x1ff);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Root->SlatLock);
+    status = IntelSplit2MbLocked(Root, pdptIndex, pdIndex, Pt);
+    if (!NT_SUCCESS(status)) {
+        ExReleasePushLockExclusive(&Root->SlatLock);
+        KeLeaveCriticalRegion();
+        return status;
+    }
+
+    if (NewSplitReason == INTEL_SPLIT_REASON_HOOK) {
+        INTEL_SLAT_SPLIT* split = IntelFindSplit(Root, pdptIndex, pdIndex);
+        if (split != NULL) {
+            split->Reason = INTEL_SPLIT_REASON_HOOK;
+        }
+    }
+    /* Lock is intentionally retained; caller releases via IntelHookReleasePt. */
+    return STATUS_SUCCESS;
+}
+
+VOID
+IntelHookReleasePt(
+    _Inout_ INTEL_EPT_ROOT* Root
+    )
+{
+    ExReleasePushLockExclusive(&Root->SlatLock);
+    KeLeaveCriticalRegion();
 }
 
 static NTSTATUS
@@ -283,9 +561,8 @@ IntelValidateOwnedAddress(
 {
     ULONG64 address = (ULONG64)PhysicalAddress.QuadPart;
 
-    if (PhysicalAddress.QuadPart < 0 ||
-        (address & (PAGE_SIZE - 1)) != 0) {
-        return STATUS_DATATYPE_MISALIGNMENT;
+    if (PhysicalAddress.QuadPart < 0) {
+        return STATUS_INVALID_ADDRESS;
     }
     if (address >= Context->MapLimit ||
         address >= HV_SLAT_MAXIMUM_ADDRESS) {
@@ -330,6 +607,7 @@ IntelQueryOwnedPageAccess(
     )
 {
     INTEL_BACKEND_CONTEXT* context;
+    INTEL_EPT_ROOT* root;
     ULONG pdptIndex;
     ULONG pdIndex;
     ULONG ptIndex;
@@ -340,6 +618,7 @@ IntelQueryOwnedPageAccess(
         return STATUS_INVALID_PARAMETER;
     }
     context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
+    root = &context->PrimaryRoot;
     status = IntelValidateOwnedAddress(
         context, PhysicalAddress, &pdptIndex, &pdIndex, &ptIndex);
     if (!NT_SUCCESS(status)) {
@@ -347,11 +626,11 @@ IntelQueryOwnedPageAccess(
     }
 
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(&context->SlatLock);
-    entry = ((ULONG64*)context->Pds[pdptIndex])[pdIndex];
+    ExAcquirePushLockShared(&root->SlatLock);
+    entry = ((ULONG64*)root->Pds[pdptIndex])[pdIndex];
     if ((entry & EPT_LARGE_PAGE) == 0) {
         ULONG64* pt = (ULONG64*)IntelFindSplitPt(
-            context, pdptIndex, pdIndex);
+            root, pdptIndex, pdIndex);
         if (pt == NULL) {
             status = STATUS_DATA_ERROR;
             goto Exit;
@@ -362,8 +641,89 @@ IntelQueryOwnedPageAccess(
     status = STATUS_SUCCESS;
 
 Exit:
-    ExReleasePushLockShared(&context->SlatLock);
+    ExReleasePushLockShared(&root->SlatLock);
     KeLeaveCriticalRegion();
+    return status;
+}
+
+NTSTATUS
+IntelSetOwnedPageMapping(
+    _Inout_ HV_STATE* State,
+    _In_ PHYSICAL_ADDRESS GuestPhysicalAddress,
+    _In_ PHYSICAL_ADDRESS HostPhysicalAddress,
+    _In_ HV_PAGE_ACCESS Access,
+    _Out_ PHYSICAL_ADDRESS* PreviousHostPhysicalAddress,
+    _Out_ HV_PAGE_ACCESS* PreviousAccess
+    )
+{
+    INTEL_BACKEND_CONTEXT* context;
+    INTEL_EPT_ROOT* root;
+    ULONG pdptIndex;
+    ULONG pdIndex;
+    ULONG ptIndex;
+    ULONG64* pt;
+    ULONG64 pte;
+    NTSTATUS status;
+    BOOLEAN invalidate = FALSE;
+    INTEL_SLAT_SPLIT* retiredSplit = NULL;
+
+    if (State == NULL || State->BackendContext == NULL ||
+        PreviousHostPhysicalAddress == NULL || PreviousAccess == NULL ||
+        HostPhysicalAddress.QuadPart < 0 ||
+        (((ULONG64)HostPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0) ||
+        (((ULONG)Access) & ~EPT_ACCESS_MASK) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!IntelSlatMayChange(State) || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
+    if ((((ULONG)Access) & HV_PAGE_ACCESS_WRITE) != 0 &&
+        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if ((((ULONG)Access) & HV_PAGE_ACCESS_EXECUTE) != 0 &&
+        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0 &&
+        (context->EptVpidCapabilities & 1) == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    status = IntelValidateOwnedAddress(
+        context, GuestPhysicalAddress, &pdptIndex, &pdIndex, &ptIndex);
+    if (!NT_SUCCESS(status)) return status;
+    if ((ULONG64)HostPhysicalAddress.QuadPart >= HV_SLAT_MAXIMUM_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    root = &context->PrimaryRoot;
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&root->SlatLock);
+    status = IntelSplit2MbLocked(root, pdptIndex, pdIndex, &pt);
+    if (NT_SUCCESS(status)) {
+        pte = pt[ptIndex];
+        PreviousHostPhysicalAddress->QuadPart =
+            (LONGLONG)(pte & EPT_ADDRESS_MASK);
+        *PreviousAccess = (HV_PAGE_ACCESS)(pte & EPT_ACCESS_MASK);
+        InterlockedExchange64(
+            (volatile LONG64*)&pt[ptIndex],
+            (LONG64)((pte & ~(EPT_ADDRESS_MASK | EPT_ACCESS_MASK)) |
+                     ((ULONG64)HostPhysicalAddress.QuadPart & EPT_ADDRESS_MASK) |
+                     (ULONG64)Access));
+        KeMemoryBarrier();
+        retiredSplit = IntelTryMerge2MbLocked(
+            root, pdptIndex, pdIndex);
+        invalidate = InterlockedCompareExchange(
+            &State->Lifecycle, 0, 0) == HV_LIFECYCLE_RUNNING;
+    }
+    ExReleasePushLockExclusive(&root->SlatLock);
+    KeLeaveCriticalRegion();
+
+    if (NT_SUCCESS(status) && invalidate) {
+        IntelInvalidateRunningSlat(State, context);
+    }
+    if (NT_SUCCESS(status)) {
+        IntelFreeRetiredSplit(retiredSplit);
+    }
     return status;
 }
 
@@ -376,16 +736,15 @@ IntelSetOwnedPageAccess(
     )
 {
     INTEL_BACKEND_CONTEXT* context;
-    INTEL_SLAT_SPLIT* split = NULL;
+    INTEL_EPT_ROOT* root;
     ULONG pdptIndex;
     ULONG pdIndex;
     ULONG ptIndex;
-    ULONG64* pd;
     ULONG64* pt;
-    ULONG64 pde;
     ULONG64 pte;
     NTSTATUS status;
     BOOLEAN invalidate = FALSE;
+    INTEL_SLAT_SPLIT* retiredSplit = NULL;
 
     if (State == NULL || PreviousAccess == NULL ||
         State->BackendContext == NULL ||
@@ -412,45 +771,13 @@ IntelSetOwnedPageAccess(
         return status;
     }
 
+    root = &context->PrimaryRoot;
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&context->SlatLock);
-    pd = (ULONG64*)context->Pds[pdptIndex];
-    pde = pd[pdIndex];
-    if ((pde & EPT_LARGE_PAGE) != 0) {
-        split = (INTEL_SLAT_SPLIT*)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, sizeof(*split), HV_POOL_TAG_SLAT_SPLIT);
-        if (split == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Exit;
-        }
-        RtlZeroMemory(split, sizeof(*split));
-        split->Pt = IntelAllocatePage(MAXLONGLONG);
-        if (split->Pt == NULL) {
-            ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Exit;
-        }
-
-        pt = (ULONG64*)split->Pt;
-        for (ULONG index = 0; index < 512; ++index) {
-            pt[index] = (pde & EPT_2MB_ADDRESS_MASK) |
-                        ((ULONG64)index << PAGE_SHIFT) |
-                        (pde & (EPT_ACCESS_MASK | (7ull << 3)));
-        }
-        split->PdptIndex = pdptIndex;
-        split->PdIndex = pdIndex;
-        InsertTailList(&context->SplitList, &split->Link);
-        KeMemoryBarrier();
-        InterlockedExchange64(
-            (volatile LONG64*)&pd[pdIndex],
-            (LONG64)(((ULONG64)MmGetPhysicalAddress(pt).QuadPart &
-                      EPT_ADDRESS_MASK) | EPT_ACCESS_MASK));
-    } else {
-        pt = (ULONG64*)IntelFindSplitPt(context, pdptIndex, pdIndex);
-        if (pt == NULL) {
-            status = STATUS_DATA_ERROR;
-            goto Exit;
-        }
+    ExAcquirePushLockExclusive(&root->SlatLock);
+    status = IntelSplit2MbLocked(
+        root, pdptIndex, pdIndex, &pt);
+    if (!NT_SUCCESS(status)) {
+        goto Exit;
     }
 
     pte = pt[ptIndex];
@@ -459,15 +786,21 @@ IntelSetOwnedPageAccess(
         (volatile LONG64*)&pt[ptIndex],
         (LONG64)((pte & ~EPT_ACCESS_MASK) | (ULONG64)Access));
     KeMemoryBarrier();
+    retiredSplit = IntelTryMerge2MbLocked(
+        root, pdptIndex, pdIndex);
     invalidate = InterlockedCompareExchange(&State->Lifecycle, 0, 0) ==
         HV_LIFECYCLE_RUNNING;
     status = STATUS_SUCCESS;
 
 Exit:
-    ExReleasePushLockExclusive(&context->SlatLock);
+    ExReleasePushLockExclusive(&root->SlatLock);
     KeLeaveCriticalRegion();
     if (NT_SUCCESS(status) && invalidate) {
         IntelInvalidateRunningSlat(State, context);
+    }
+    /* The old PT cannot be reclaimed until every CPU discarded its walk. */
+    if (NT_SUCCESS(status)) {
+        IntelFreeRetiredSplit(retiredSplit);
     }
     return status;
 }

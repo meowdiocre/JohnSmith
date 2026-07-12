@@ -3,6 +3,79 @@
 
 #define VMX_EVENT_INFORMATION_MASK 0x80000FFFu
 
+VOID
+IntelDecodeEptViolation(
+    _In_ ULONG64 Qualification,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _In_ ULONG64 GuestLinearAddress,
+    _Out_ INTEL_EPT_VIOLATION* Decoded
+    )
+{
+
+    RtlZeroMemory(Decoded, sizeof(*Decoded));
+    Decoded->Qualification = Qualification;
+    Decoded->GuestPhysicalAddress = GuestPhysicalAddress;
+    Decoded->LinearValid =
+        (Qualification & VMX_EPT_QUAL_GLA_VALID) != 0;
+    if (Decoded->LinearValid) {
+        Decoded->GuestLinearAddress = GuestLinearAddress;
+    }
+    Decoded->Translation =
+        (Qualification & VMX_EPT_QUAL_TRANSLATION) != 0;
+    Decoded->Read = (Qualification & VMX_EPT_QUAL_READ) != 0;
+    Decoded->Write = (Qualification & VMX_EPT_QUAL_WRITE) != 0;
+    Decoded->Execute = (Qualification & VMX_EPT_QUAL_EXECUTE) != 0;
+    Decoded->EptReadable =
+        (Qualification & VMX_EPT_QUAL_EPT_READABLE) != 0;
+    Decoded->EptWritable =
+        (Qualification & VMX_EPT_QUAL_EPT_WRITABLE) != 0;
+    Decoded->EptExecutable =
+        (Qualification & VMX_EPT_QUAL_EPT_EXECUTABLE) != 0;
+}
+
+DECLSPEC_NORETURN
+VOID
+IntelFailEptViolation(
+    _In_ const HV_CPU* Cpu,
+    _In_ const INTEL_EPT_VIOLATION* Decoded,
+    _In_ ULONG64 GuestRip
+    )
+{
+
+    ULONG64 packed = ((ULONG64)Cpu->ProcessorIndex & 0xffull) |
+                     ((ULONG64)(Decoded->LinearValid ? 1u : 0u) << 8) |
+                     ((ULONG64)(Decoded->Translation ? 1u : 0u) << 9) |
+                     ((ULONG64)(Decoded->Read ? 1u : 0u) << 10) |
+                     ((ULONG64)(Decoded->Write ? 1u : 0u) << 11) |
+                     ((ULONG64)(Decoded->Execute ? 1u : 0u) << 12) |
+                     ((ULONG64)(Decoded->EptReadable ? 1u : 0u) << 13) |
+                     ((ULONG64)(Decoded->EptWritable ? 1u : 0u) << 14) |
+                     ((ULONG64)(Decoded->EptExecutable ? 1u : 0u) << 15);
+    KeBugCheckEx(
+        HYPERVISOR_ERROR,
+        INTEL_BUGCHECK_EPT_VIOLATION,
+        Decoded->Qualification,
+        Decoded->GuestPhysicalAddress,
+        (ULONG_PTR)(packed ^ (GuestRip & ~0xffffull)));
+}
+
+DECLSPEC_NORETURN
+VOID
+IntelFailEptMisconfiguration(
+    _In_ const HV_CPU* Cpu,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _In_ ULONG64 GuestRip
+    )
+{
+
+    KeBugCheckEx(
+        HYPERVISOR_ERROR,
+        INTEL_BUGCHECK_EPT_MISCONFIG,
+        (ULONG_PTR)Cpu->ProcessorIndex,
+        GuestPhysicalAddress,
+        GuestRip);
+}
+
 NTSTATUS
 IntelSetLaunchState(
     _In_ ULONG64 GuestRsp,
@@ -180,6 +253,176 @@ IntelFailEventCollision(
         GuestRip);
 }
 
+typedef enum _INTEL_EVENT_CLASS {
+    INTEL_EVENT_CLASS_BENIGN = 0,
+    INTEL_EVENT_CLASS_CONTRIBUTORY = 1,
+    INTEL_EVENT_CLASS_PAGE_FAULT = 2
+} INTEL_EVENT_CLASS;
+
+static INTEL_EVENT_CLASS
+IntelClassifyEvent(
+    _In_ ULONG Information
+    )
+{
+    ULONG type = (Information >> 8) & 7u;
+    ULONG vector = Information & 0xffu;
+
+    /* Only hardware exceptions (type 3) count toward double-fault pairs. */
+    if (type != 3) {
+        return INTEL_EVENT_CLASS_BENIGN;
+    }
+    switch (vector) {
+    case 10:  /* #TS */
+    case 11:  /* #NP */
+    case 12:  /* #SS */
+    case 13:  /* #GP */
+        return INTEL_EVENT_CLASS_CONTRIBUTORY;
+    case 14:  /* #PF */
+        return INTEL_EVENT_CLASS_PAGE_FAULT;
+    default:
+        return INTEL_EVENT_CLASS_BENIGN;
+    }
+}
+
+static BOOLEAN
+IntelPairGeneratesDoubleFault(
+    _In_ INTEL_EVENT_CLASS Pending,
+    _In_ INTEL_EVENT_CLASS New
+    )
+{
+
+    if (Pending == INTEL_EVENT_CLASS_CONTRIBUTORY &&
+        New == INTEL_EVENT_CLASS_CONTRIBUTORY) {
+        return TRUE;
+    }
+    if (Pending == INTEL_EVENT_CLASS_PAGE_FAULT &&
+        (New == INTEL_EVENT_CLASS_CONTRIBUTORY ||
+         New == INTEL_EVENT_CLASS_PAGE_FAULT)) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static VOID
+IntelSetPrimaryControl(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ ULONG Bit,
+    _In_ BOOLEAN Enable
+    )
+{
+    ULONG controls = Context->PrimaryControls;
+    ULONG updated = Enable ? (controls | Bit) : (controls & ~Bit);
+
+    if (updated == controls) {
+        return;
+    }
+    if (NT_SUCCESS(IntelVmWrite(
+            VMCS_PRIMARY_PROCESSOR_CONTROLS, updated))) {
+        Context->PrimaryControls = updated;
+    }
+}
+
+static BOOLEAN
+IntelGuestCanTakeNmi(
+    VOID
+    )
+{
+    ULONG64 interruptibility;
+
+    if (!IntelVmReadValue(
+            VMCS_GUEST_INTERRUPTIBILITY, &interruptibility)) {
+        return FALSE;
+    }
+    return (interruptibility &
+            (VMX_GUEST_BLOCKING_BY_NMI |
+             VMX_GUEST_BLOCKING_BY_MOV_SS)) == 0;
+}
+
+static BOOLEAN
+IntelGuestCanTakeInterrupt(
+    VOID
+    )
+{
+    ULONG64 interruptibility;
+    ULONG64 rflags;
+
+    if (!IntelVmReadValue(
+            VMCS_GUEST_INTERRUPTIBILITY, &interruptibility) ||
+        !IntelVmReadValue(VMCS_GUEST_RFLAGS, &rflags)) {
+        return FALSE;
+    }
+    if ((interruptibility &
+         (VMX_GUEST_BLOCKING_BY_STI |
+          VMX_GUEST_BLOCKING_BY_MOV_SS)) != 0) {
+        return FALSE;
+    }
+    return (rflags & (1ull << 9)) != 0; /* IF */
+}
+
+VOID
+IntelRequestNmiInjection(
+    _Inout_ INTEL_CPU_CONTEXT* Context
+    )
+{
+
+    if (IntelGuestCanTakeNmi()) {
+        if (NT_SUCCESS(IntelVmWrite(
+                VMCS_ENTRY_INTERRUPTION_INFO, 0x80000202u))) {
+            return;
+        }
+    }
+    InterlockedExchange(&Context->PendingNmi, 1);
+    IntelSetPrimaryControl(Context, VMX_PRIMARY_NMI_WINDOW, TRUE);
+}
+
+VOID
+IntelRequestInterruptInjection(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ UCHAR Vector
+    )
+{
+    if (IntelGuestCanTakeInterrupt()) {
+        ULONG info = 0x80000000u | (0u << 8) | (ULONG)Vector;
+        if (NT_SUCCESS(IntelVmWrite(
+                VMCS_ENTRY_INTERRUPTION_INFO, info))) {
+            return;
+        }
+    }
+    Context->PendingInterruptVector = Vector;
+    InterlockedExchange(&Context->PendingInterruptValid, 1);
+    IntelSetPrimaryControl(Context, VMX_PRIMARY_INTERRUPT_WINDOW, TRUE);
+}
+
+VOID
+IntelHandleNmiWindow(
+    _Inout_ INTEL_CPU_CONTEXT* Context
+    )
+{
+
+    if (InterlockedExchange(&Context->PendingNmi, 0) != 0) {
+        /*
+         * VMX Type 2 (NMI) with vector 2, valid.  Deliver-error-code is
+         * clear for NMIs.
+         */
+        (VOID)IntelVmWrite(
+            VMCS_ENTRY_INTERRUPTION_INFO, 0x80000202u);
+    }
+    IntelSetPrimaryControl(Context, VMX_PRIMARY_NMI_WINDOW, FALSE);
+}
+
+VOID
+IntelHandleInterruptWindow(
+    _Inout_ INTEL_CPU_CONTEXT* Context
+    )
+{
+    if (InterlockedExchange(&Context->PendingInterruptValid, 0) != 0) {
+        ULONG info = 0x80000000u | (0u << 8) |
+                     ((ULONG)Context->PendingInterruptVector & 0xffu);
+        (VOID)IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, info);
+    }
+    IntelSetPrimaryControl(Context, VMX_PRIMARY_INTERRUPT_WINDOW, FALSE);
+}
+
 static VOID
 IntelInjectException(
     _In_ ULONG Information,
@@ -194,8 +437,23 @@ IntelInjectException(
 
     Information &= VMX_EVENT_INFORMATION_MASK;
     if ((PendingInformation & (1u << 31)) != 0) {
-        IntelFailEventCollision(
-            Cpu, Reason, PendingInformation, Information, GuestRip);
+
+        INTEL_EVENT_CLASS pendingClass = IntelClassifyEvent(PendingInformation);
+        INTEL_EVENT_CLASS newClass = IntelClassifyEvent(Information);
+        BOOLEAN pendingIsDoubleFault =
+            ((PendingInformation >> 8) & 7u) == 3u &&
+            (PendingInformation & 0xffu) == 8u;
+
+        if (pendingIsDoubleFault &&
+            newClass != INTEL_EVENT_CLASS_BENIGN) {
+            IntelFailEventCollision(
+                Cpu, Reason, PendingInformation, Information, GuestRip);
+        }
+        if (IntelPairGeneratesDoubleFault(pendingClass, newClass)) {
+            Information = VMX_ENTRY_INJECT_DF;
+            ErrorCode = 0;
+        }
+
     }
 
     status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, Information);
@@ -392,11 +650,6 @@ IntelHandleCrAccess(
             ULONG64 guestCr4;
             BOOLEAN suppressInvalidation;
 
-            /*
-             * Intel SDM rev. 092, MOV to/from Control Registers: with
-             * CR4.PCIDE set, source bit 63 suppresses invalidation but is
-             * never stored in CR3.
-             */
             if (!IntelVmReadValue(VMCS_CR4_READ_SHADOW, &guestCr4)) {
                 return STATUS_HV_INVALID_VP_STATE;
             }
@@ -487,28 +740,65 @@ IntelHandleCrAccess(
     return STATUS_NOT_SUPPORTED;
 }
 
-static BOOLEAN
-IntelHandleXsetbv(
-    _In_ INTEL_GUEST_REGISTERS* Registers
+static NTSTATUS
+IntelHandleDrAccess(
+    _Inout_ INTEL_GUEST_REGISTERS* Registers
     )
 {
-    ULONG64 requested;
-    ULONG64 csSelector;
+    ULONG64 qualification;
     ULONG64 guestCr4;
+    ULONG64 value;
+    ULONG dr;
+    ULONG direction;
+    ULONG reg;
+    NTSTATUS status;
 
-    if ((ULONG)Registers->Rcx != 0 ||
-        !IntelVmReadValue(VMCS_GUEST_CS_SELECTOR, &csSelector) ||
-        !IntelVmReadValue(VMCS_GUEST_CR4, &guestCr4) ||
-        (csSelector & 3) != 0 || (guestCr4 & (1ull << 18)) == 0) {
-        return FALSE;
+    if (!IntelVmReadValue(VMCS_EXIT_QUALIFICATION, &qualification) ||
+        !IntelVmReadValue(VMCS_CR4_READ_SHADOW, &guestCr4)) {
+        return STATUS_HV_INVALID_VP_STATE;
     }
-    requested = ((ULONG64)(ULONG)Registers->Rdx << 32) |
-                (ULONG)Registers->Rax;
-    if (!HvX86IsValidXcr0(requested)) {
-        return FALSE;
+    dr = (ULONG)(qualification & 7);
+    direction = (ULONG)((qualification >> 4) & 1);
+    reg = (ULONG)((qualification >> 8) & 0xf);
+
+    if (dr == 4 || dr == 5) {
+        if ((guestCr4 & X86_CR4_DE) != 0) {
+            return STATUS_ILLEGAL_INSTRUCTION;
+        }
+        dr += 2;
     }
-    _xsetbv(0, requested);
-    return TRUE;
+    if (dr > 3 && dr != 6 && dr != 7) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (direction == 0) {
+        status = IntelGetRegister(Registers, reg, &value);
+        if (!NT_SUCCESS(status)) return status;
+        switch (dr) {
+        case 0: __writedr(0, value); break;
+        case 1: __writedr(1, value); break;
+        case 2: __writedr(2, value); break;
+        case 3: __writedr(3, value); break;
+        case 6: __writedr(6, value); break;
+        case 7: return IntelVmWrite(VMCS_GUEST_DR7, value);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    switch (dr) {
+    case 0: value = __readdr(0); break;
+    case 1: value = __readdr(1); break;
+    case 2: value = __readdr(2); break;
+    case 3: value = __readdr(3); break;
+    case 6: value = __readdr(6); break;
+    case 7:
+        if (!IntelVmReadValue(VMCS_GUEST_DR7, &value)) {
+            return STATUS_HV_INVALID_VP_STATE;
+        }
+        break;
+    default: return STATUS_NOT_SUPPORTED;
+    }
+    return IntelSetRegister(Registers, reg, value);
 }
 
 static BOOLEAN
@@ -606,13 +896,18 @@ IntelVmExitHandler(
     IntelFlushEptIfNeeded(context);
 
     if (reason == VMX_EXIT_INIT_SIGNAL) {
-        /*
-         * Processor reset/hotplug is unsupported while JohnSmith is active.
-         * Intel specifies that an INIT-induced VM exit has not modified the
-         * guest state.  Leave the VMCS active and resume that unchanged state;
-         * a subsequent SIPI is then discarded by hardware because the guest
-         * is not in the wait-for-SIPI activity state.
-         */
+
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+    }
+
+    if (reason == VMX_EXIT_NMI_WINDOW) {
+
+        IntelHandleNmiWindow(context);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+    }
+
+    if (reason == VMX_EXIT_INTERRUPT_WINDOW) {
+        IntelHandleInterruptWindow(context);
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
@@ -660,6 +955,28 @@ IntelVmExitHandler(
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 
+    if (reason == VMX_EXIT_RDTSC || reason == VMX_EXIT_RDTSCP) {
+        ULONG64 tscOffset;
+        ULONG64 tsc;
+
+        if (!IntelVmReadValue(VMCS_TSC_OFFSET, &tscOffset)) {
+            KeBugCheckEx(HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 13, guestRip);
+        }
+        if (reason == VMX_EXIT_RDTSCP) {
+            unsigned int aux;
+            tsc = __rdtscp(&aux) + tscOffset;
+            Registers->Rcx = aux;
+        } else {
+            tsc = __rdtsc() + tscOffset;
+        }
+        Registers->Rax = (ULONG)tsc;
+        Registers->Rdx = (ULONG)(tsc >> 32);
+        IntelAdvanceGuestRip(
+            context, Cpu, reason, guestRip, instructionLength);
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+    }
+
     if (reason == VMX_EXIT_EXCEPTION_OR_NMI) {
         ULONG64 information;
         ULONG64 errorCode = 0;
@@ -701,6 +1018,25 @@ IntelVmExitHandler(
         } else {
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 11, guestRip);
+        }
+        return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+    }
+
+    if (reason == VMX_EXIT_DR_ACCESS) {
+        status = IntelHandleDrAccess(Registers);
+        if (NT_SUCCESS(status)) {
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
+        } else if (status == STATUS_ILLEGAL_INSTRUCTION) {
+            IntelInjectInvalidOpcode(
+                pendingInformation, Cpu, reason, guestRip);
+        } else if (status == STATUS_NOT_SUPPORTED) {
+            IntelInjectException(
+                VMX_ENTRY_INJECT_GP, 0, pendingInformation,
+                Cpu, reason, guestRip);
+        } else {
+            KeBugCheckEx(HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 14, guestRip);
         }
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
@@ -754,6 +1090,9 @@ IntelVmExitHandler(
     if (reason == VMX_EXIT_EPT_VIOLATION) {
         ULONG64 qualification = 0;
         ULONG64 guestPhysical = 0;
+        ULONG64 guestLinear = 0;
+        INTEL_EPT_VIOLATION decoded;
+        INTEL_HOOK_POLICY policy;
 
         if (!IntelVmReadValue(VMCS_EXIT_QUALIFICATION, &qualification) ||
             !IntelVmReadValue(
@@ -761,35 +1100,81 @@ IntelVmExitHandler(
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 5, guestRip);
         }
-        KeBugCheckEx(
-            HYPERVISOR_ERROR,
-            INTEL_BUGCHECK_EPT_VIOLATION,
-            qualification,
-            guestPhysical,
-            guestRip);
+        /* SDM rev. 092, Table 28-7: GLA is architecturally valid only when
+           qualification bit 7 is set.  Only read it in that case. */
+        if ((qualification & VMX_EPT_QUAL_GLA_VALID) != 0 &&
+            !IntelVmReadValue(
+                VMCS_GUEST_LINEAR_ADDRESS, &guestLinear)) {
+            KeBugCheckEx(HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 15, guestRip);
+        }
+        IntelDecodeEptViolation(
+            qualification, guestPhysical, guestLinear, &decoded);
+
+        if (IntelHookLookup(guestPhysical, &policy)) {
+            INTEL_BACKEND_CONTEXT* backend =
+                (INTEL_BACKEND_CONTEXT*)context->BackendContext;
+            const INTEL_EPT_ROOT* target = NULL;
+
+            if (backend != NULL && backend->HookRoot != NULL) {
+                BOOLEAN onSecondary = (context->EptPointer ==
+                                       backend->HookRoot->EptPointer);
+                if (decoded.Execute && !onSecondary) {
+                    target = backend->HookRoot;
+                } else if (!decoded.Execute && onSecondary) {
+                    target = &backend->PrimaryRoot;
+                }
+            }
+            if (target != NULL) {
+                NTSTATUS switchStatus =
+                    IntelSwitchActiveEptRoot(context, target);
+                if (NT_SUCCESS(switchStatus)) {
+                    /* Retry the guest instruction on the new view; do
+                       not advance RIP. */
+                    return IntelCompleteVmExit(
+                        context, INTEL_VMEXIT_RESUME);
+                }
+            }
+            /* Policy match but view already correct (or unswitchable):
+               fail-stop with policy identity in bugcheck parameter 4 so
+               bring-up can diagnose the stuck transition. */
+            KeBugCheckEx(
+                HYPERVISOR_ERROR,
+                INTEL_BUGCHECK_EPT_VIOLATION,
+                decoded.Qualification,
+                decoded.GuestPhysicalAddress,
+                ((ULONG64)policy.Cookie << 32) | policy.Kind);
+        }
+
+        {
+            INTEL_BACKEND_CONTEXT* backend =
+                (INTEL_BACKEND_CONTEXT*)context->BackendContext;
+            if (backend != NULL && backend->HookRoot != NULL &&
+                context->EptPointer == backend->HookRoot->EptPointer &&
+                decoded.Execute) {
+                NTSTATUS switchStatus = IntelSwitchActiveEptRoot(
+                    context, &backend->PrimaryRoot);
+                if (NT_SUCCESS(switchStatus)) {
+                    return IntelCompleteVmExit(
+                        context, INTEL_VMEXIT_RESUME);
+                }
+            }
+        }
+
+        IntelFailEptViolation(Cpu, &decoded, guestRip);
     }
 
     if (reason == VMX_EXIT_EPT_MISCONFIGURATION) {
         ULONG64 guestPhysical = 0;
         (VOID)IntelVmReadValue(
             VMCS_GUEST_PHYSICAL_ADDRESS, &guestPhysical);
-        KeBugCheckEx(HYPERVISOR_ERROR,
-            INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, guestPhysical, guestRip);
+        IntelFailEptMisconfiguration(Cpu, guestPhysical, guestRip);
     }
 
     if (reason == VMX_EXIT_XSETBV) {
-        if (IntelHandleXsetbv(Registers)) {
-            IntelAdvanceGuestRip(
-                context, Cpu, reason, guestRip, instructionLength);
-        } else {
-            IntelInjectException(
-                VMX_ENTRY_INJECT_GP,
-                0,
-                pendingInformation,
-                Cpu,
-                reason,
-                guestRip);
-        }
+        IntelInjectException(
+            VMX_ENTRY_INJECT_GP, 0, pendingInformation,
+            Cpu, reason, guestRip);
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
     }
 

@@ -370,7 +370,10 @@ static const HV_BACKEND_OPS AmdBackendOps = {
     AmdStop,
     AmdReportStartFailure,
     AmdQueryOwnedPageAccess,
-    AmdSetOwnedPageAccess
+    AmdSetOwnedPageAccess,
+    NULL,
+    NULL,
+    NULL
 };
 
 const HV_BACKEND_OPS*

@@ -236,8 +236,7 @@ IntelSetupVmcs(
         return STATUS_HV_FEATURE_UNAVAILABLE;
     }
 
-    eptp = ((ULONG64)MmGetPhysicalAddress(backend->Pml4).QuadPart &
-            EPT_ADDRESS_MASK) | EPT_MEMORY_TYPE_WB | (3ull << 3);
+    eptp = backend->PrimaryRoot.EptPointer;
     context->EptPointer = eptp;
     context->Vpid = (secondaryControls & VMX_SECONDARY_ENABLE_VPID) != 0
         ? (USHORT)(Cpu->ProcessorIndex + 1) : 0;
