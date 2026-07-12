@@ -111,8 +111,7 @@ AmdSetupVmcb(
     vmcb->State.Rax = 0;
 
     vmcb->Control.InterceptMisc1 =
-        AMD_INTERCEPT_CPUID | AMD_INTERCEPT_INVLPGA |
-        AMD_INTERCEPT_MSR;
+        AMD_INTERCEPT_INVLPGA | AMD_INTERCEPT_MSR;
     vmcb->Control.InterceptMisc2 = AMD_INTERCEPT_SVM_INSTRUCTIONS;
     __cpuid(cpuid, 1);
     if ((((ULONG)cpuid[2]) & (1u << 26)) != 0) {

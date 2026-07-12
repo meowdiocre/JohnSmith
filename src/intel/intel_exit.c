@@ -130,9 +130,7 @@ IntelRestoreVectoringEvent(
     NTSTATUS status;
 
     *PendingInformation = 0;
-    status = IntelVmWrite(VMCS_ENTRY_INTERRUPTION_INFO, 0);
-    if (!NT_SUCCESS(status)) return status;
-
+    /* SDM 27.8.3: every VM exit clears the injected-event valid bit. */
     if (!IntelVmReadValue(VMCS_IDT_VECTORING_INFO, &information)) {
         return STATUS_HV_INVALID_VP_STATE;
     }
@@ -615,26 +613,41 @@ IntelVmExitHandler(
         ULONG leaf = (ULONG)Registers->Rax;
         ULONG subleaf = (ULONG)Registers->Rcx;
 
-        __cpuidex(cpuid, (int)leaf, (int)subleaf);
-        Registers->Rax = (ULONG)cpuid[0];
-        Registers->Rbx = (ULONG)cpuid[1];
-        Registers->Rcx = (ULONG)cpuid[2];
-        Registers->Rdx = (ULONG)cpuid[3];
-        if (leaf == 1) {
-            Registers->Rcx &= ~((1u << 5) | (1u << 31));
-        } else if (leaf == 7 && subleaf == 0 &&
-                   (context->SecondaryControls &
-                    VMX_SECONDARY_ENABLE_INVPCID) == 0) {
-            Registers->Rbx &= ~(1u << 10);
-        } else if (leaf == 0xDu && subleaf == 1 &&
-                   (context->SecondaryControls &
-                    VMX_SECONDARY_ENABLE_XSAVES) == 0) {
-            Registers->Rax &= ~(1u << 3);
-        } else if (leaf == 0x80000001u &&
-                   (context->SecondaryControls &
-                    VMX_SECONDARY_ENABLE_RDTSCP) == 0) {
-            Registers->Rdx &= ~(1u << 27);
+        if (leaf == 0) {
+            Registers->Rax = context->CpuidLeaf0Eax;
+            Registers->Rbx = context->CpuidLeaf0Ebx;
+            Registers->Rcx = context->CpuidLeaf0Ecx;
+            Registers->Rdx = context->CpuidLeaf0Edx;
+        } else {
+            __cpuidex(cpuid, (int)leaf, (int)subleaf);
+            Registers->Rax = (ULONG)cpuid[0];
+            Registers->Rbx = (ULONG)cpuid[1];
+            Registers->Rcx = (ULONG)cpuid[2];
+            Registers->Rdx = (ULONG)cpuid[3];
         }
+
+        switch (leaf) {
+        case 1:
+            Registers->Rcx &= 0x7FFFFFDFull;
+            break;
+        case 7:
+            if (subleaf == 0 && context->CpuidClearLeaf7Ebx != 0) {
+                Registers->Rbx &= ~(ULONG64)context->CpuidClearLeaf7Ebx;
+            }
+            break;
+        case 0xDu:
+            if (subleaf == 1 && context->CpuidClearLeafDEax != 0) {
+                Registers->Rax &= ~(ULONG64)context->CpuidClearLeafDEax;
+            }
+            break;
+        case 0x80000001u:
+            if (context->CpuidClearLeaf80000001Edx != 0) {
+                Registers->Rdx &=
+                    ~(ULONG64)context->CpuidClearLeaf80000001Edx;
+            }
+            break;
+        }
+
         IntelAdvanceGuestRip(
             context, Cpu, reason, guestRip, instructionLength);
         return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);

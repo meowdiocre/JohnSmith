@@ -33,6 +33,10 @@ context per CPU, so the existing processor-local assignment and fallback to
 ASID 1 are valid; a global ASID allocator would add synchronization without
 avoiding any flush.
 
+CPUID executes natively without intercept. AMD InterceptMisc1 bit 18 (IntCpuid)
+is cleared; the CPU retires CPUID in guest mode with zero VM-exit overhead.
+Since the handler previously applied no feature masks, visibility is unchanged.
+
 I/O intercepts are disabled until JohnSmith owns a real port policy; allocating
 an all-zero IOPM only adds state without behavior.
 

@@ -8,6 +8,30 @@ HV_MAGIC_RCX EQU 0C0DEC0DE4E41454Ch
 HV_MAGIC_RDX EQU 053544F504F4E4C59h
 HV_MAGIC_R8  EQU 0A55A5AA5F00DCAFEh
 
+VMCS_EXIT_REASON              EQU 04402h
+VMCS_IDT_VECTORING_INFO       EQU 04408h
+VMCS_EXIT_INSTRUCTION_LENGTH  EQU 0440Ch
+VMCS_GUEST_CS_AR              EQU 04816h
+VMCS_GUEST_INTERRUPTIBILITY   EQU 04824h
+VMCS_GUEST_RIP                EQU 0681Eh
+VMCS_GUEST_RFLAGS             EQU 06820h
+
+VMX_EXIT_CPUID                EQU 10
+VMX_EXIT_VMCALL               EQU 18
+VMX_EVENT_VALID               EQU 080000000h
+VMX_BLOCKING_STI_MOVSS        EQU 3
+RFLAGS_TF                     EQU 0100h
+CS_AR_LONG_MODE               EQU 02000h
+
+HOST_FRAME_CPU_GENERATION     EQU 8
+HOST_FRAME_BACKEND_GENERATION EQU 16
+HOST_FRAME_CPUID_LEAF0        EQU 24
+HOST_FRAME_FAST_PATH_ENABLED  EQU 40
+
+IFNDEF JOHNSMITH_VMEXIT_BENCHMARK
+JOHNSMITH_VMEXIT_BENCHMARK EQU 0
+ENDIF
+
 .code
 
 IntelAsmLaunch PROC
@@ -61,6 +85,157 @@ IntelInvvpidFailed:
 IntelAsmInvvpid ENDP
 
 IntelAsmVmExit PROC
+    ; Handle the simple CPUID case without constructing a C ABI frame.  Every
+    ; state that the C path might consume or modify is checked before changing
+    ; guest state; a failed check falls through with all guest GPRs intact.
+    push r8
+    push r9
+    push r10
+    push r11
+
+    lea r10, [rsp + 32]
+    cmp qword ptr [r10 + HOST_FRAME_FAST_PATH_ENABLED], 1
+    jne IntelVmExitSlowPath
+
+    mov r8d, VMCS_EXIT_REASON
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    cmp r9d, VMX_EXIT_CPUID
+    je IntelVmExitCheckCpuidLeaf
+
+IF JOHNSMITH_VMEXIT_BENCHMARK
+    cmp r9d, VMX_EXIT_VMCALL
+    jne IntelVmExitSlowPath
+    mov r8, 04A534D5642454E43h
+    cmp rax, r8
+    jne IntelVmExitSlowPath
+    mov r8, 0484D41524B464C52h
+    cmp rcx, r8
+    jne IntelVmExitSlowPath
+    mov r8, 0564D43414C4C3031h
+    cmp rdx, r8
+    jne IntelVmExitSlowPath
+    mov r8, 0B16B00B5DEADC0DEh
+    cmp qword ptr [rsp + 24], r8
+    jne IntelVmExitSlowPath
+    ; Deliberately minimal, benchmark-only VMCALL completion.  This measures
+    ; VM-exit + RIP advancement + VMRESUME without CPUID emulation or the
+    ; production fast path's architectural guard checks.
+    jmp IntelVmExitBenchmarkAdvanceRip
+ELSE
+    jmp IntelVmExitSlowPath
+ENDIF
+
+IF JOHNSMITH_VMEXIT_BENCHMARK
+IntelVmExitBenchmarkAdvanceRip:
+    mov r8d, VMCS_EXIT_INSTRUCTION_LENGTH
+    vmread r11, r8
+    jbe IntelVmExitSlowPath
+    mov r8d, VMCS_GUEST_RIP
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    add r9, r11
+    vmwrite r9, r8
+    jbe IntelVmExitSlowPath
+    jmp IntelVmExitFastResume
+ENDIF
+
+IntelVmExitCheckCpuidLeaf:
+    ; Leaf 0 is the timer hot path.  Bypass all masked-leaf dispatch before
+    ; entering the common architectural guard sequence.
+    test eax, eax
+    jz IntelVmExitCheckCommonState
+    ; Leaf 1 is always masked.  The other listed subleaves may require masks
+    ; when their corresponding VM-execution control is unavailable.
+    cmp eax, 1
+    je IntelVmExitSlowPath
+    cmp eax, 7
+    jne IntelVmExitCheckLeafD
+    test ecx, ecx
+    je IntelVmExitSlowPath
+IntelVmExitCheckLeafD:
+    cmp eax, 0Dh
+    jne IntelVmExitCheckExtendedLeaf
+    cmp ecx, 1
+    je IntelVmExitSlowPath
+IntelVmExitCheckExtendedLeaf:
+    cmp eax, 080000001h
+    je IntelVmExitSlowPath
+
+IntelVmExitCheckCommonState:
+    ; The writer publishes EPT updates by interlocked generation increment.
+    ; Ordered, aligned x86 loads are sufficient to detect the common no-change
+    ; case; a mismatch delegates INVEPT and the generation update to C.
+    mov r8, qword ptr [r10 + HOST_FRAME_CPU_GENERATION]
+    mov r9, qword ptr [r10 + HOST_FRAME_BACKEND_GENERATION]
+    test r8, r8
+    jz IntelVmExitSlowPath
+    test r9, r9
+    jz IntelVmExitSlowPath
+    mov r8, qword ptr [r8]
+    cmp r8, qword ptr [r9]
+    jne IntelVmExitSlowPath
+
+    mov r8d, VMCS_IDT_VECTORING_INFO
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    test r9d, VMX_EVENT_VALID
+    jnz IntelVmExitSlowPath
+
+    mov r8d, VMCS_GUEST_INTERRUPTIBILITY
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    test r9d, VMX_BLOCKING_STI_MOVSS
+    jnz IntelVmExitSlowPath
+
+    mov r8d, VMCS_GUEST_RFLAGS
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    test r9d, RFLAGS_TF
+    jnz IntelVmExitSlowPath
+
+    ; CS.L=1 proves that RIP must not be truncated to EIP on advancement.
+    mov r8d, VMCS_GUEST_CS_AR
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    test r9d, CS_AR_LONG_MODE
+    jz IntelVmExitSlowPath
+
+    mov r8d, VMCS_EXIT_INSTRUCTION_LENGTH
+    vmread r11, r8
+    jbe IntelVmExitSlowPath
+    mov r8d, VMCS_GUEST_RIP
+    vmread r9, r8
+    jbe IntelVmExitSlowPath
+    add r9, r11
+    vmwrite r9, r8
+    jbe IntelVmExitSlowPath
+
+    test eax, eax
+    jnz IntelVmExitNativeCpuid
+    mov eax, dword ptr [r10 + HOST_FRAME_CPUID_LEAF0 + 0]
+    mov ebx, dword ptr [r10 + HOST_FRAME_CPUID_LEAF0 + 4]
+    mov ecx, dword ptr [r10 + HOST_FRAME_CPUID_LEAF0 + 8]
+    mov edx, dword ptr [r10 + HOST_FRAME_CPUID_LEAF0 + 12]
+    jmp IntelVmExitFastResume
+
+IntelVmExitNativeCpuid:
+    cpuid
+
+IntelVmExitFastResume:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    vmresume
+    ud2
+
+IntelVmExitSlowPath:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+
     ; Ascending frame offsets are RAX, RCX, RDX, RBX, RBP, RSI, RDI,
     ; R8..R15.  VMCS host RSP points at the owning HV_CPU pointer.
     push r15

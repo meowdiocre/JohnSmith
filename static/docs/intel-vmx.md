@@ -60,12 +60,29 @@ and limits; after VMXOFF, it restores them with LGDT and LIDT. Restoring only
 the bases, or using launch-time snapshots, leaves Windows with stale state.
 
 CPUID exits unconditionally in VMX non-root operation (Section 28.1.2).
-JohnSmith executes CPUID on the current logical processor for every exit because
-topology, APIC ID, OSXSAVE, XCR0, and XSS-dependent results are not globally
-cacheable. Returned features are masked to match enabled VMX controls and the
-no-nested-VMX policy. Caching can shorten a handler but cannot remove the VM
-exit or its elapsed time. RDTSC/RDTSCP execute natively: RDTSC exiting and TSC
-offsetting remain disabled, so JohnSmith does not claim timing invisibility.
+Leaf 0 is stable and cached per CPU during VMCS setup. JohnSmith executes other
+leaves on the current logical processor because topology, APIC ID, OSXSAVE,
+XCR0, and XSS-dependent results are not globally cacheable. Returned features
+are masked to match enabled VMX controls and the no-nested-VMX policy.
+Feature-clear masks are pre-computed once in INTEL_CPU_CONTEXT during VMCS
+setup; the exit handler applies them via switch dispatch without runtime
+control-flag branches. Caching can shorten a handler but cannot remove the VM
+exit or its elapsed time. Release builds first attempt a narrow assembly path.
+It accepts leaf 0 immediately (and unmasked leaves after dispatch), verifies
+that EPT generation, IDT vectoring, STI/MOV-SS blocking, TF, and CS.L are in the
+simple state, advances RIP using the VMCS instruction length, and resumes
+without a C call or XMM save/restore. Any failed check reaches the unchanged C
+path before guest-visible state is modified. VM exits clear the valid bit in
+the injected-event identification field (Section 27.8.3), so the C event path
+does not issue a redundant zero VMWRITE before inspecting IDT vectoring.
+RDTSC/RDTSCP execute natively: RDTSC exiting and TSC offsetting remain
+disabled, so JohnSmith does not claim timing invisibility.
+
+`JohnSmithVmexitBenchmark=1` is a measurement-only build property. It enables a
+signature-gated VMCALL path that performs only exit-reason dispatch, guest-RIP
+advancement, and VMRESUME. Production builds leave the property at zero and
+continue injecting `#UD` for non-stop VMCALLs. The benchmark path is not part
+of the production correctness surface.
 
 VPIDs are processor-local translation tags; one system-wide VPID is not
 required. JohnSmith retains one nonzero VPID per pinned CPU context. Native

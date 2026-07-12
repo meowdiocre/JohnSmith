@@ -36,6 +36,19 @@ typedef struct _INTEL_GUEST_REGISTERS {
     ULONG64 R15;
 } INTEL_GUEST_REGISTERS;
 
+/* VMCS host RSP addresses this fixed record for the assembly fast path. */
+typedef struct _INTEL_HOST_STACK_FRAME {
+    HV_CPU* Cpu;
+    volatile LONG64* CpuSlatGeneration;
+    volatile LONG64* BackendSlatGeneration;
+    ULONG CpuidLeaf0Eax;
+    ULONG CpuidLeaf0Ebx;
+    ULONG CpuidLeaf0Ecx;
+    ULONG CpuidLeaf0Edx;
+    ULONG64 FastPathEnabled;
+    ULONG64 Reserved[2];
+} INTEL_HOST_STACK_FRAME;
+
 typedef struct _INTEL_EXIT_RECORD {
     volatile ULONG64 Sequence;
     ULONG64 GuestRip;
@@ -97,6 +110,13 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG RequiredSecondaryControls;
     ULONG RequiredExitControls;
     ULONG RequiredEntryControls;
+    ULONG CpuidClearLeaf7Ebx;
+    ULONG CpuidClearLeafDEax;
+    ULONG CpuidClearLeaf80000001Edx;
+    ULONG CpuidLeaf0Eax;
+    ULONG CpuidLeaf0Ebx;
+    ULONG CpuidLeaf0Ecx;
+    ULONG CpuidLeaf0Edx;
     volatile LONG64 ExitSequence;
     volatile LONG64 CompletedExitSequence;
     ULONG64 LastExitEntryTsc;
@@ -105,6 +125,12 @@ typedef struct _INTEL_CPU_CONTEXT {
 } INTEL_CPU_CONTEXT;
 
 C_ASSERT(FIELD_OFFSET(HV_CPU, VendorContext) == 16);
+C_ASSERT(sizeof(INTEL_HOST_STACK_FRAME) == 64);
+C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, Cpu) == 0);
+C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, CpuSlatGeneration) == 8);
+C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, BackendSlatGeneration) == 16);
+C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, CpuidLeaf0Eax) == 24);
+C_ASSERT(FIELD_OFFSET(INTEL_HOST_STACK_FRAME, FastPathEnabled) == 40);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRsp) == 56);
 C_ASSERT(FIELD_OFFSET(INTEL_CPU_CONTEXT, ResumeRip) == 64);
 C_ASSERT((INTEL_EXIT_HISTORY_COUNT & (INTEL_EXIT_HISTORY_COUNT - 1)) == 0);

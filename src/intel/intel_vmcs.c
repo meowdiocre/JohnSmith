@@ -112,12 +112,14 @@ IntelSetupVmcs(
     ULONG desiredPrimary;
     ULONG requiredExit;
     ULONG requiredEntry;
+    ULONG maxBasicLeaf;
     ULONG64 cr0Fixed0;
     ULONG64 cr0Fixed1;
     ULONG64 cr4Fixed0;
     ULONG64 cr4Fixed1;
     ULONG64 hostRsp;
     ULONG64 eptp;
+    INTEL_HOST_STACK_FRAME* hostFrame;
     int cpuid[4];
     NTSTATUS status;
 
@@ -159,14 +161,18 @@ IntelSetupVmcs(
         }
     }
     __cpuid(cpuid, 0);
-    if ((ULONG)cpuid[0] >= 7) {
+    maxBasicLeaf = (ULONG)cpuid[0];
+    context->CpuidLeaf0Eax = (ULONG)cpuid[0];
+    context->CpuidLeaf0Ebx = (ULONG)cpuid[1];
+    context->CpuidLeaf0Ecx = (ULONG)cpuid[2];
+    context->CpuidLeaf0Edx = (ULONG)cpuid[3];
+    if (maxBasicLeaf >= 7) {
         __cpuidex(cpuid, 7, 0);
         if ((((ULONG)cpuid[1]) & (1u << 10)) != 0) {
             desiredSecondary |= VMX_SECONDARY_ENABLE_INVPCID;
         }
     }
-    __cpuid(cpuid, 0);
-    if ((ULONG)cpuid[0] >= 0xDu) {
+    if (maxBasicLeaf >= 0xDu) {
         __cpuidex(cpuid, 0xD, 1);
         if ((((ULONG)cpuid[0]) & (1u << 3)) != 0) {
             desiredSecondary |= VMX_SECONDARY_ENABLE_XSAVES;
@@ -204,6 +210,12 @@ IntelSetupVmcs(
     context->RequiredSecondaryControls = requiredSecondary;
     context->RequiredExitControls = requiredExit;
     context->RequiredEntryControls = requiredEntry;
+    context->CpuidClearLeaf7Ebx = (secondaryControls &
+        VMX_SECONDARY_ENABLE_INVPCID) ? 0 : (1u << 10);
+    context->CpuidClearLeafDEax = (secondaryControls &
+        VMX_SECONDARY_ENABLE_XSAVES) ? 0 : (1u << 3);
+    context->CpuidClearLeaf80000001Edx = (secondaryControls &
+        VMX_SECONDARY_ENABLE_RDTSCP) ? 0 : (1u << 27);
     context->ControlFailureMask = 0;
     if ((primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION;
@@ -235,7 +247,20 @@ IntelSetupVmcs(
     cr4Fixed1 = __readmsr(IA32_VMX_CR4_FIXED1);
     hostRsp = ((ULONG64)context->HostStack + INTEL_HOST_STACK_SIZE - 64) &
               ~0xfull;
-    *(HV_CPU**)hostRsp = Cpu;
+    hostFrame = (INTEL_HOST_STACK_FRAME*)hostRsp;
+    RtlZeroMemory(hostFrame, sizeof(*hostFrame));
+    hostFrame->Cpu = Cpu;
+    hostFrame->CpuSlatGeneration = &context->SlatGeneration;
+    hostFrame->BackendSlatGeneration = &backend->SlatGeneration;
+    hostFrame->CpuidLeaf0Eax = context->CpuidLeaf0Eax;
+    hostFrame->CpuidLeaf0Ebx = context->CpuidLeaf0Ebx;
+    hostFrame->CpuidLeaf0Ecx = context->CpuidLeaf0Ecx;
+    hostFrame->CpuidLeaf0Edx = context->CpuidLeaf0Edx;
+#if JOHNSMITH_DIAGNOSTICS
+    hostFrame->FastPathEnabled = 0;
+#else
+    hostFrame->FastPathEnabled = 1;
+#endif
 
     VMX_WRITE(VMCS_PIN_BASED_CONTROLS, pinControls);
     VMX_WRITE(VMCS_PRIMARY_PROCESSOR_CONTROLS, primaryControls);

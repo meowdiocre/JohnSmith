@@ -53,6 +53,7 @@
     <TargetExt>.sys</TargetExt>
     <EnableInf2Cat>false</EnableInf2Cat>
     <SupportsPackaging>false</SupportsPackaging>
+    <JohnSmithVmexitBenchmark Condition="'$(JohnSmithVmexitBenchmark)'==''">0</JohnSmithVmexitBenchmark>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -66,6 +67,7 @@
     </ClCompile>
     <MASM>
       <IncludePaths>$(ProjectDir)include;%(IncludePaths)</IncludePaths>
+      <PreprocessorDefinitions>JOHNSMITH_VMEXIT_BENCHMARK=$(JohnSmithVmexitBenchmark);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -85,6 +87,7 @@
     </ClCompile>
     <MASM>
       <IncludePaths>$(ProjectDir)include;%(IncludePaths)</IncludePaths>
+      <PreprocessorDefinitions>JOHNSMITH_VMEXIT_BENCHMARK=$(JohnSmithVmexitBenchmark);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
