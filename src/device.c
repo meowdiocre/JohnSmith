@@ -186,7 +186,8 @@ JsHandleHookInstall(
         return status;
     }
     request = (const JOHNSMITH_HOOK_INSTALL_REQUEST*)Input;
-    if (request->PatchSize == 0 ||
+    if (request->Reserved != 0 ||
+        request->PatchSize == 0 ||
         request->PatchSize > JOHNSMITH_HOOK_MAX_PATCH ||
         (ULONG64)request->PatchOffset + request->PatchSize > PAGE_SIZE) {
         return STATUS_INVALID_PARAMETER;

@@ -59,13 +59,13 @@ Normative references:
 
 1. **[PARTIAL]** Strong types exist for permissions and EPT roots, but GPA, HPA,
    and hook IDs still use generic integer/`PHYSICAL_ADDRESS` types.
-2. **[NOT IMPLEMENTED]** The backend interface contains hook operations even
-   though only Intel implements them; the requested Intel-specific root/view
-   separation is absent.
+2. **[NOT IMPLEMENTED]** The backend interface still contains hook operations,
+   but both backend operation tables expose them as unsupported. The requested
+   Intel-specific root/view separation is absent.
 3. **[PARTIAL]** Hook installation follows hook-lock → root-lock order and
    rendezvous occurs after lock release. The contract is not encoded or tested.
-4. **[PARTIAL]** Permission-split retirement waits for invalidation. Hook
-   retirement does not force vCPUs off the secondary root and is unsafe.
+4. **[BLOCKED BY DEFECT]** A force-primary rendezvous exists, but removal
+   unpublishes policy before enabling it. The hook callbacks remain disabled.
 5. **[PARTIAL]** Patch and SLAT address checks exist. Canonical GVA, page-walk,
    user-buffer, and physical-width coverage is incomplete.
 6. **[PARTIAL]** EPT qualification decoding is factored into a helper. PFEC,
@@ -130,10 +130,10 @@ versus data classification, invalid-GLA handling, CR2 isolation, or retry RIP.
 
 ## Stage 3 — event and exit robustness, one reason at a time
 
-1. **[PARTIAL]** Intel classifies benign/contributory/page-fault exceptions and
-   promotes the architectural double-fault pairs. Serial event preservation,
-   shutdown semantics, instruction-length cases, and hardware tests remain
-   open.
+1. **[PARTIAL]** Intel classifies vectors 0, 10-14, 20, and 21 according to SDM
+   Table 7-4, promotes architectural double-fault pairs, and preserves the
+   already restored event for serial pairs. Shutdown semantics,
+   instruction-length cases, and hardware tests remain open.
 2. **[NOT IMPLEMENTED]** Interrupt/NMI window injection has dead scaffold code,
    not a complete feature. No producer calls it. If the NMI request function
    were called, it could enable NMI-window exiting without NMI exiting and
@@ -156,30 +156,27 @@ Files: `src/intel/intel_hook.c`, `src/intel/intel_internal.h`,
 1. **[PARTIAL]** `INTEL_EPT_ROOT` owns PML4/PDPT/PD/split-list/lock/EPTP
    metadata, and primary/secondary roots are separate. The requested reference
    counts are absent.
-2. **[IMPLEMENTED (code)]** A lazily allocated deep-copy EPT root is built at
-   PASSIVE_LEVEL. Uniform, mixed RAM/MMIO, and non-RAM leaves all honor the
-   requested R/W-only secondary-root permissions.
-3. **[IMPLEMENTED (code)]** A cached contiguous shadow is allocated, patched
-   with checked bounds, and copied from the HPA currently mapped by the primary
-   root. Non-identity runtime tests remain absent.
-4. **[IMPLEMENTED (code)]** Install capability-gates execute-only EPT, changes
-   the primary PTE to R/W, and maps the shadow X-only in the secondary PTE.
-   This local PTE operation does not make the hook subsystem complete.
-5. **[IMPLEMENTED (code)]** The three transition branches retry without
-   advancing RIP, and the secondary root remains non-executable outside shadow
-   pages.
-6. **[IMPLEMENTED (code)]** Per-vCPU active EPTP tracking and generation-based
-   INVEPT on view switches exist. **[NOT VERIFIED]** under concurrent all-core
-   transitions.
-7. **[IMPLEMENTED (code)]** Removal unpublishes a versioned slot, forces and
-   verifies every vCPU on the primary root, reacquires both PTEs before changing
-   either, restores and invalidates both views, then frees the shadow. Failure
-   republishes the unchanged policy. Duplicate GPAs are rejected, live shadows
-   are freed at teardown, and the secondary-root pool tag is consistent.
+2. **[BLOCKED BY DEFECT]** The lazily allocated secondary root is a fresh
+   identity R/W map, not a deep copy. It does not inherit or track primary
+   remaps and permission changes.
+3. **[BLOCKED BY DEFECT]** A cached contiguous shadow is patched from the HPA
+   currently mapped by the primary root, but arbitrary RAM/MMIO targets and
+   cache aliases are not rejected.
+4. **[BLOCKED BY DEFECT]** Install forces the primary PTE to R/W and creates an
+   executable shadow without proving that the original target policy allowed
+   those accesses.
+5. **[PARTIAL]** Transition branches retry without advancing RIP, but the
+   subsystem is externally disabled until the view invariants are repaired.
+6. **[PARTIAL]** Per-vCPU EPTP tracking and generation-based INVEPT exist, but
+   concurrent all-core transitions have no focused evidence.
+7. **[BLOCKED BY DEFECT]** Install changes PTEs before publishing policy.
+   Removal unpublishes policy before setting force-primary. Both gaps allow a
+   legitimate violation to reach fail-stop handling.
 
-Acceptance gate: **[NOT VERIFIED]**. There is no committed hook test harness or
-bare-metal evidence for original-read/shadow-execute behavior, page crossing,
-concurrent install/remove, memory type, or safe retirement.
+Acceptance gate: **[BLOCKED BY DEFECT]**. Intel backend hook callbacks remain
+disabled. Re-enable only after policy synchronization, target validation,
+transactional publication/removal, focused concurrency tests, and bare-metal
+evidence.
 
 ## Stage 5 — AMD CPUID policy
 
@@ -198,11 +195,12 @@ concurrent install/remove, memory type, or safe retirement.
 2. **[PARTIAL]** The ABI uses fixed-width versioned headers, `METHOD_BUFFERED`,
    length checks, and a SYSTEM/Administrators SDDL. There is no explicit
    debug-privilege check; access is ACL-based.
-3. **[PARTIAL]** Status and Intel hook add/remove/query commands exist. HPA, GPA,
-   GVA, and translate commands do not.
+3. **[PARTIAL]** Status and hook add/remove/query ABI definitions exist, but the
+   hook backend is disabled. HPA, GPA, GVA, and translate commands do not exist.
 4. **[NOT IMPLEMENTED]** No 4/5-level guest page-table walker exists.
 5. **[NOT IMPLEMENTED]** No executable-write coherency or MMIO range policy
-   exists because physical-memory commands are absent.
+   exists. The disabled hook implementation already demonstrates why this
+   policy is required before consuming arbitrary physical mappings.
 6. **[IMPLEMENTED (code)]** IOCTL handlers acquire rundown protection before
    reading the published `HV_STATE*`. Unpublish blocks new requests and waits
    for in-flight handlers before hypervisor stop.
@@ -224,8 +222,8 @@ host-address-space claim should be made.
 1. Complete Stage 0 contracts and add unit-testable helpers/tests.
 2. Harden Stage 1 remap/split/merge with focused tests.
 3. Complete Stage 2 classified EPT policy only where hook policy needs it.
-4. Add Stage 4 focused and concurrent runtime tests before claiming hardware
-   support.
+4. Keep Stage 4 disabled until its root synchronization, publication ordering,
+   memory policy, and focused concurrent tests are complete.
 5. Add Stage 6 memory APIs/walker only when a concrete consumer requires them.
 6. Implement Stage 3 event features individually, enabling controls only with
    complete producers and handlers.

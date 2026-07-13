@@ -13,8 +13,8 @@ Keep changes narrow, architecture-backed, and warning-free.
 7. Cite the manual revision and section for architecture changes.
 8. Run the relevant bare-metal lifecycle and SLAT tests.
 
-Use the checklist in [Build and test](docs/build-and-test.md). Performance work
-must follow [Performance and measurement](docs/performance.md).
+Use the checklist and measurement evidence rules in
+[Build and test](docs/build-and-test.md).
 
 ## Evidence
 

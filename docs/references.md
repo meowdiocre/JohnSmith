@@ -15,9 +15,9 @@ Snapshot verified: **2026-07-12**.
 
 | Source | Revision | Local copy | Project use |
 | --- | --- | --- | --- |
-| Intel 64 and IA-32 SDM, combined volumes | 092, current as of 2026-06-22 | [325462-092](../static/docs/325462-092-sdm-vol-1-2abcd-3abcd-4.pdf) | VMX, EPT, VPID, instructions, exceptions, MSRs |
-| AMD64 APM Volume 2: System Programming | 24593 rev. 3.44, 2026-03-06 | [24593-3.44](../static/docs/24593_3.44_APM_Vol2.pdf) | SVM, VMCB, NPT, ASID, event injection |
-| AMD64 APM Volumes 1-5 | 40332 rev. 4.09 | [40332-4.09](../static/docs/40332_4.09_AMD64_APM_Volumes_1-5.pdf) | Cross-volume instruction and architecture lookup |
+| Intel 64 and IA-32 SDM, combined volumes | 092, June 2026 | [325462-092](../static/docs/325462-092-sdm-vol-1-2abcd-3abcd-4.pdf) | VMX, EPT, VPID, instructions, exceptions, MSRs |
+| AMD64 APM Volume 2: System Programming | 24593 rev. 3.44, March 2026 | [24593-3.44](../static/docs/24593_3.44_APM_Vol2.pdf) | SVM, VMCB, NPT, ASID, event injection |
+| AMD64 APM Volumes 1-5 | 40332 rev. 4.09, March 2026 | [40332-4.09](../static/docs/40332_4.09_AMD64_APM_Volumes_1-5.pdf) | Cross-volume instruction and architecture lookup |
 | Intel VT-d Architecture Specification | D51397-019, rev. 5.20, 2026-04 | [VT-d 5.20](../static/docs/D51397-019_Intel_VT-d_Architecture_Spec_5.2.pdf) | Future IOMMU work; not implemented |
 
 Official live indexes:

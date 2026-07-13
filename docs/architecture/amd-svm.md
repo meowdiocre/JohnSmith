@@ -17,9 +17,9 @@ Normative source: [AMD64 APM Volume 2, publication 24593 revision 3.44](../../st
 | Next RIP | Require NRIPS | VMCB `nRIP` support |
 | CET | Reject `CR4.CET=1` | Project safety policy |
 
-Every assembly-visible VMCB field has a compile-time offset assertion. Optional
-features are derived from CPUID; no VMCB field or clean bit is inferred from an
-Intel encoding.
+Every assembly-visible VMCB field has a compile-time offset assertion. Required
+SVM/VMCB features and guest-writable EFER enable bits are gated by AMD CPUID;
+no VMCB field or clean bit is inferred from an Intel encoding.
 
 ## VMCB policy
 
@@ -92,9 +92,12 @@ an event already selected for `EVENTINJ` and a new exception is a fail-stop
 condition.
 
 CPUID policy hides hypervisor, VMX, and SVM exposure while retaining native
-topology and OS-dependent results. MSRPM policy virtualizes EFER, VM_CR, and VM_HSAVE_PA while rejecting unsupported
-intercepted accesses with `#GP`. VM_CR writes enforce reserved-bit and LOCK/SVMDIS
-semantics; VM_HSAVE_PA writes enforce alignment and physical-width constraints.
+topology and OS-dependent results. MSRPM policy virtualizes EFER, VM_CR, and
+VM_HSAVE_PA while rejecting unsupported intercepted accesses with `#GP`. EFER
+SCE, NXE, LMSLE, FFXSR, TCE, MCOMMIT, INTWB, UAIE, and AIBRSE writes are gated
+by their documented CPUID fields. VM_CR writes enforce reserved-bit and
+LOCK/SVMDIS semantics; VM_HSAVE_PA writes enforce alignment and physical-width
+constraints.
 Guest SVM instructions and INVLPGA receive `#UD`; nested SVM is not implemented.
 XSETBV receives `#GP` until transition code owns separate host and guest XCR0.
 

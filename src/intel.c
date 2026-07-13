@@ -516,9 +516,11 @@ static const HV_BACKEND_OPS IntelBackendOps = {
     IntelReportStartFailure,
     IntelQueryOwnedPageAccess,
     IntelSetOwnedPageAccess,
-    IntelHookInstall,
-    IntelHookRemove,
-    IntelHookQuery
+    /* ponytail: Re-enable only after transactional dual-root publication,
+       permission preservation, RAM/MMIO policy, and concurrency tests. */
+    NULL,
+    NULL,
+    NULL
 };
 
 const HV_BACKEND_OPS*

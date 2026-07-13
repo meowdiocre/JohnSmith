@@ -193,7 +193,7 @@
 #define EPT_ADDRESS_MASK                    0x000FFFFFFFFFF000ull
 #define EPT_2MB_ADDRESS_MASK                0x000FFFFFFFE00000ull
 
-/* Intel SDM rev. 092, Table 28-7 (EPT-violation exit qualification). */
+/* Intel SDM rev. 092, Table 30-7 (EPT-violation exit qualification). */
 #define VMX_EPT_QUAL_READ                   (1ull << 0)
 #define VMX_EPT_QUAL_WRITE                  (1ull << 1)
 #define VMX_EPT_QUAL_EXECUTE                (1ull << 2)

@@ -1,6 +1,7 @@
 # JohnSmith
 
-Minimal blue-pill Windows x64 research hypervisor with Intel VT-x/EPT and AMD-V/SVM/NPT backends. This project is focused on red teaming capabilities, including stealth, injection, persistence, spoofing, and EDR evasion.
+Minimal blue-pill Windows x64 research hypervisor with Intel VT-x/EPT and
+AMD-V/SVM/NPT backends. It is a foundation for controlled red-team research. With the Goal of Stealth measurement, injection, persistence, spoofing, and detection-evasion.
 
 ![JohnSmith banner](static/img/main.png)
 
@@ -12,10 +13,10 @@ Minimal blue-pill Windows x64 research hypervisor with Intel VT-x/EPT and AMD-V/
 | Area | Implementation |
 | --- | --- |
 | Lifecycle | Synchronized all-CPU launch, rollback, and teardown |
-| Intel | VMX, EPT, VPID, VMCS control validation, CPUID policy |
-| AMD | SVM/NPT and masked CPUID policy present |
-| Memory | 512 GiB identity-SLAT ceiling; runtime 4 KiB access changes |
-| State | CR0/CR3/CR4, debug state, PAT/EFER, MSR bitmaps |
+| Intel | VMX, EPT, VPID, VMCS control validation, and CPUID policy |
+| AMD | SVM/NPT and masked CPUID policy |
+| Memory | 512 GiB identity-SLAT ceiling, partially tested runtime 4 KiB access changes |
+| State | CR0/CR3/CR4, debug state, PAT/EFER, and MSR bitmaps modeled in code |
 | Diagnostics | Fail-stop bugchecks and Debug-only VM-exit history |
 | Measurement | Cross-core software-clock VM-exit benchmark |
 
@@ -30,19 +31,9 @@ hidden.
 | [Documentation Index](DOCUMENTATION.md) | Scope, policy, and repository map |
 | [Intel VMX/EPT](docs/architecture/intel-vmx.md) | VMCS, exits, EPT, VPID, CET |
 | [AMD SVM/NPT](docs/architecture/amd-svm.md) | VMCB, exits, NPT, ASIDs |
-| [Performance](docs/performance.md) | Benchmark design and evidence rules |
 | [Build and Test](docs/build-and-test.md) | Reproducible build/load workflow instructions |
 | [References](docs/references.md) | Manuals, papers, revisions, and hashes |
 
-## Deliberate limits
-
-- No nested VMX or nested SVM.
-- No processor reset, hot-add, or memory hot-add while active.
-- No recoverable EPT/NPT violation emulator.
-- No root supervisor-CET or shadow-stack implementation.
-- No I/O virtualization or device model.
-- No timing-invisibility claim.
-- AMD runtime validation remains required on supported bare-metal SVM hardware.
 
 ## License
 

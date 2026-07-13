@@ -71,7 +71,8 @@ the handler.
 | All-CPU launch | Required | Required | No |
 | Rollback after injected failure | Required | Required | No |
 | Live SLAT permission change | INVEPT generation | VMMCALL/TLB_CONTROL generation | No |
-| CPUID policy | Masked/emulated | Blocked: intercepted, handler absent | No |
+| CPUID policy | Masked/emulated | Masked/emulated | No |
+| Hook IOCTLs | Disabled pending safety fixes | Unsupported | No |
 | Teardown/state restoration | Required | Required | No |
 | Debug/Release/Benchmark compile | Required | Required | Yes |
 | WDK analysis | Required | Required | Yes |

@@ -79,6 +79,42 @@ AmdApplyCpuidPolicy(
     }
 }
 
+static ULONG64
+AmdGetSupportedEferMask(
+    VOID
+    )
+{
+    const ULONG64 baseMask =
+        (1ull << 8) |  /* LME */
+        (1ull << 10) | /* LMA */
+        (1ull << 12);  /* SVME */
+    ULONG64 mask = baseMask;
+    ULONG maximumLeaf;
+    int cpuid[4];
+
+    __cpuid(cpuid, 0x80000000);
+    maximumLeaf = (ULONG)cpuid[0];
+    if (maximumLeaf >= 0x80000001u) {
+        __cpuid(cpuid, 0x80000001);
+        if ((((ULONG)cpuid[3]) & (1u << 11)) != 0) mask |= 1ull << 0;
+        if ((((ULONG)cpuid[3]) & (1u << 20)) != 0) mask |= 1ull << 11;
+        if ((((ULONG)cpuid[3]) & (1u << 25)) != 0) mask |= 1ull << 14;
+        if ((((ULONG)cpuid[2]) & (1u << 17)) != 0) mask |= 1ull << 15;
+    }
+    if (maximumLeaf >= 0x80000008u) {
+        __cpuid(cpuid, 0x80000008);
+        if ((((ULONG)cpuid[1]) & (1u << 20)) == 0) mask |= 1ull << 13;
+        if ((((ULONG)cpuid[1]) & (1u << 8)) != 0) mask |= 1ull << 17;
+        if ((((ULONG)cpuid[1]) & (1u << 13)) != 0) mask |= 1ull << 18;
+    }
+    if (maximumLeaf >= 0x80000021u) {
+        __cpuid(cpuid, 0x80000021);
+        if ((((ULONG)cpuid[0]) & (1u << 7)) != 0) mask |= 1ull << 20;
+        if ((((ULONG)cpuid[0]) & (1u << 8)) != 0) mask |= 1ull << 21;
+    }
+    return mask;
+}
+
 ULONG
 AmdVmExitHandler(
     _Inout_ AMD_GUEST_REGISTERS* Registers,
@@ -145,7 +181,8 @@ AmdVmExitHandler(
             msrValue = ((ULONG64)(ULONG)Registers->Rdx << 32) |
                        (ULONG)vmcb->State.Rax;
             if (msr == AMD_MSR_EFER) {
-                const ULONG64 validEfer = 0x000000000036FD01ull;
+                const ULONG64 validEfer = AmdGetSupportedEferMask();
+                NT_ASSERT((validEfer & ~0x000000000036FD01ull) == 0);
                 if ((msrValue & ~validEfer) != 0 ||
                     (((msrValue ^ context->GuestEfer) & (1ull << 8)) != 0 &&
                      (vmcb->State.Cr0 & (1ull << 31)) != 0)) {

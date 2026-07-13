@@ -120,10 +120,13 @@ IntelGetAdvancedGuestRip(
     }
 
     nextRip = GuestRip + InstructionLength;
-    if ((Context->EntryControls & VMX_ENTRY_IA32E_MODE) == 0 ||
-        (csAccessRights & (1ull << 13)) == 0) {
-        /* Outside 64-bit code, architectural RIP is the zero-extended EIP. */
+    if ((Context->EntryControls & VMX_ENTRY_IA32E_MODE) != 0 &&
+        (csAccessRights & (1ull << 13)) != 0) {
+        /* 64-bit code advances the full RIP. */
+    } else if ((csAccessRights & (1ull << 14)) != 0) {
         nextRip = (ULONG)nextRip;
+    } else {
+        nextRip = (GuestRip & ~0xffffull) | (USHORT)nextRip;
     }
     *AdvancedGuestRip = nextRip;
     return STATUS_SUCCESS;
@@ -272,12 +275,15 @@ IntelClassifyEvent(
         return INTEL_EVENT_CLASS_BENIGN;
     }
     switch (vector) {
+    case 0:   /* #DE */
     case 10:  /* #TS */
     case 11:  /* #NP */
     case 12:  /* #SS */
     case 13:  /* #GP */
+    case 21:  /* #CP */
         return INTEL_EVENT_CLASS_CONTRIBUTORY;
     case 14:  /* #PF */
+    case 20:  /* #VE */
         return INTEL_EVENT_CLASS_PAGE_FAULT;
     default:
         return INTEL_EVENT_CLASS_BENIGN;
@@ -452,6 +458,9 @@ IntelInjectException(
         if (IntelPairGeneratesDoubleFault(pendingClass, newClass)) {
             Information = VMX_ENTRY_INJECT_DF;
             ErrorCode = 0;
+        } else {
+            /* IntelRestoreVectoringEvent already restored the older event. */
+            return;
         }
 
     }
@@ -810,14 +819,46 @@ IntelIsVmxInstructionExit(
            Reason == 50 || Reason == 53 || Reason == 59;
 }
 
+_Success_(return != FALSE)
+static BOOLEAN
+IntelCaptureGuestControlRegister(
+    _In_ ULONG GuestField,
+    _In_ ULONG MaskField,
+    _In_ ULONG ShadowField,
+    _Out_ PULONG64 Value
+    )
+{
+    ULONG64 actual;
+    ULONG64 mask;
+    ULONG64 shadow;
+
+    *Value = 0;
+    if (!IntelVmReadValue(GuestField, &actual) ||
+        !IntelVmReadValue(MaskField, &mask) ||
+        !IntelVmReadValue(ShadowField, &shadow)) {
+        return FALSE;
+    }
+    *Value = (actual & ~mask) | (shadow & mask);
+    NT_ASSERT(((0xa5ull & ~0xf0ull) | (0x3cull & 0xf0ull)) == 0x35ull);
+    return TRUE;
+}
+
 static BOOLEAN
 IntelCaptureStopState(
     _Out_ INTEL_CPU_CONTEXT* Context
     )
 {
-    return IntelVmReadValue(VMCS_CR0_READ_SHADOW, &Context->ResumeCr0) &&
+    return IntelCaptureGuestControlRegister(
+               VMCS_GUEST_CR0,
+               VMCS_CR0_GUEST_HOST_MASK,
+               VMCS_CR0_READ_SHADOW,
+               &Context->ResumeCr0) &&
            IntelVmReadValue(VMCS_GUEST_CR3, &Context->ResumeCr3) &&
-           IntelVmReadValue(VMCS_CR4_READ_SHADOW, &Context->ResumeCr4) &&
+           IntelCaptureGuestControlRegister(
+               VMCS_GUEST_CR4,
+               VMCS_CR4_GUEST_HOST_MASK,
+               VMCS_CR4_READ_SHADOW,
+               &Context->ResumeCr4) &&
            IntelVmReadValue(VMCS_GUEST_DR7, &Context->ResumeDr7) &&
            IntelVmReadValue(VMCS_GUEST_FS_BASE, &Context->ResumeFsBase) &&
            IntelVmReadValue(VMCS_GUEST_GS_BASE, &Context->ResumeGsBase) &&
@@ -1100,7 +1141,7 @@ IntelVmExitHandler(
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 5, guestRip);
         }
-        /* SDM rev. 092, Table 28-7: GLA is architecturally valid only when
+        /* SDM rev. 092, Table 30-7: GLA is architecturally valid only when
            qualification bit 7 is set.  Only read it in that case. */
         if ((qualification & VMX_EPT_QUAL_GLA_VALID) != 0 &&
             !IntelVmReadValue(

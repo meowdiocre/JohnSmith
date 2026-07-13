@@ -48,6 +48,10 @@ CR4 mask = IA32_VMX_CR4_FIXED0 | ~IA32_VMX_CR4_FIXED1 | CR4.VMXE
 Read shadows preserve the values visible to the guest. `FIXED0 ^ FIXED1` is
 not an ownership mask; it selects flexible positions.
 
+Teardown reconstructs each guest-visible control register as
+`(guest field & ~mask) | (read shadow & mask)`. Mask-zero positions are
+guest-owned and must not be restored from stale read shadows.
+
 `VMCLEAR` precedes the initial VMCS population. Guest interruptibility and
 pending-debug fields are initialized once before `VMLAUNCH`, then updated only
 when exit semantics require it.
@@ -106,12 +110,14 @@ the IDT-vectoring fields.
 Successful instruction emulation consumes saved STI/MOV-SS blocking as required
 by Section 29.7.1. If `RFLAGS.TF=1` and `IA32_DEBUGCTL.BTF=0`, it sets pending
 debug `BS` as required by Section 29.7.3. Existing pending causes are preserved.
+Hardware exceptions use SDM Table 7-4 classes. Double-fault pairs replace the
+restored event with `#DF`; serial pairs keep the already restored event.
 
 RIP advancement follows Section 29.3.1.4:
 
-- use 64-bit arithmetic only when `CS.L=1`;
-- otherwise truncate to EIP so the result wraps at 4 GiB;
-- never leave guest RIP bits 63:32 set for compatibility or legacy code.
+- use 64-bit arithmetic when `CS.L=1`;
+- use zero-extended EIP when `CS.L=0` and `CS.D=1`;
+- update only IP bits 15:0 when `CS.L=0` and `CS.D=0`.
 
 Interrupt-window and NMI-window injection are **not implemented features**.
 One-slot request/handler scaffold code remains in `intel_exit.c` and
@@ -161,14 +167,14 @@ policy and per-vCPU CR2 virtualization in place.
 ### Dual-EPT hook views
 
 > [!CAUTION]
-> The source-level lifecycle is implemented, but the capability has no committed
-> bare-metal or concurrency-test evidence.
+> The backend callbacks are disabled. The checked-in implementation has
+> publication races, divergent roots, target-policy weakening, and no complete
+> RAM/MMIO/cache policy.
 
-Hook installation attaches a second `INTEL_EPT_ROOT` (`HookRoot`) to the
-backend, allocated lazily on the first install and freed at backend teardown.
-The hook root is a deep-copy mapping with R+W permissions. Uniform 2 MiB,
-mixed RAM/MMIO 4 KiB, and non-RAM mappings all honor that mask, keeping the
-secondary root non-executable outside installed shadow pages.
+The checked-in implementation attaches a second `INTEL_EPT_ROOT` (`HookRoot`)
+and builds a new identity R/W map. It is not a deep copy and is not synchronized
+with primary remaps or later permission changes. While a vCPU uses this root,
+unrelated data accesses can bypass primary-root policy.
 
 For each installed hook:
 
@@ -203,13 +209,11 @@ writes `VMCS_EPT_POINTER`, updates the vCPU's cached `EptPointer`, resets its
 generation counter to force mismatch on the next check, and then invokes the
 same INVEPT path so the newly-loaded root sees no stale translations.
 
-Hook removal first unpublishes a versioned policy slot, forces and verifies all
-vCPUs on `PrimaryRoot`, reacquires both PTEs before changing either, restores
-both views, invalidates again, and only then frees the shadow. A reacquisition
-failure republishes the unchanged policy. Duplicate GPAs are rejected, live
-shadow pages are freed during backend teardown, and hook mutations are
-serialized. Hook-created 4 KiB splits remain allocated until backend teardown;
-focused runtime and concurrency tests are still required.
+Install changes PTEs before publishing the policy slot. Removal unpublishes the
+slot before setting force-primary. A vCPU can therefore observe a legitimate
+hook violation without a matching policy and reach fail-stop handling. Target
+pages are also changed to primary R/W and shadow X without proving that the
+original permission and memory-type policy permits this transformation.
 
 ## MSR and nested-VMX policy
 
@@ -235,11 +239,12 @@ the hot path.
 surface. The device ACL grants read/write access to
 SYSTEM and BUILTIN\\Administrators only. `IOCTL_JOHNSMITH_STATUS` returns the
 lifecycle, backend name, CPU counts, and the ABI version from
-`include/johnsmith_ioctl.h`. Hook install/remove/query IOCTLs are wired to the
-Intel backend. Each handler holds rundown protection on the published
-hypervisor; unload blocks new requests and waits for in-flight requests before
-stop. HPA, GPA, GVA, translate, and other physical-memory IOCTLs are not
-implemented.
+`include/johnsmith_ioctl.h`. Hook install/remove/query request definitions and
+handlers remain, but the Intel backend callbacks are disabled, so requests
+return `STATUS_NOT_SUPPORTED`. Each handler holds rundown protection on the
+published hypervisor; unload blocks new requests and waits for in-flight
+requests before stop. HPA, GPA, GVA, translate, and other physical-memory
+IOCTLs are not implemented.
 
 ## Deliberate exclusions
 

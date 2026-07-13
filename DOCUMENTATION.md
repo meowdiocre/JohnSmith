@@ -9,7 +9,6 @@ Architecture documentation snapshot: **2026-07-13**.
 | Audited implementation status | [Source-to-claim status](docs/implementation-status.md) |
 | Intel virtualization | [VMX/EPT architecture map](docs/architecture/intel-vmx.md) |
 | AMD virtualization | [SVM/NPT architecture map](docs/architecture/amd-svm.md) |
-| VM-exit optimization | [Performance and measurement](docs/performance.md) |
 | Build, load, and validation | [Build and test](docs/build-and-test.md) |
 | Source provenance | [Reference catalog](docs/references.md) |
 | Contribution rules | [CONTRIBUTING.md](CONTRIBUTING.md) |
