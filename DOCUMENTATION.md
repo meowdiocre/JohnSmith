@@ -1,6 +1,6 @@
 # Documentation
 
-Architecture documentation snapshot: **2026-07-13**.
+Architecture documentation snapshot: **2026-07-19**.
 
 ## Start here
 
@@ -40,7 +40,7 @@ src/intel/            VMCS, VM-exit, and EPT implementation
 src/amd/              VMCB, VM-exit, and NPT implementation
 src/hv.c              Backend selection and all-CPU lifecycle
 src/introspection.c   Owned-page permission exercise
-tools/                Loader and VM-exit benchmark
+tools/                Control client, loader, and VM-exit benchmark
 docs/                 Maintained design and operating documentation
 static/docs/          Pinned original manuals and research papers
 ```

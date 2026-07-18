@@ -68,6 +68,31 @@ if ($plans) {
     throw 'generated planning files remain'
 }
 
+$documentation = @(
+    Read-RepoFile 'README.md'
+    Read-RepoFile 'DOCUMENTATION.md'
+)
+$documentation += Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Recurse -File -Filter '*.md' |
+    ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }
+$documentationText = $documentation -join "`n"
+$obsoleteDocumentation = @(
+    'IOCTL',
+    'johnsmith_ioctl',
+    '\\Device\\JohnSmith',
+    'load-kdu\.ps1',
+    'unload-kdu\.ps1',
+    'StartRequested',
+    'ept-roadmap'
+)
+foreach ($pattern in $obsoleteDocumentation) {
+    if ($documentationText -match $pattern) {
+        throw "obsolete documentation reference remains: $pattern"
+    }
+}
+if (Test-Path -LiteralPath (Join-Path $root 'docs/ept-roadmap.md')) {
+    throw 'speculative EPT roadmap remains'
+}
+
 $debugMarkers = Get-ChildItem -LiteralPath (Join-Path $root 'src') -Recurse -File -Filter '*.c' |
     Select-String -SimpleMatch 'stage='
 if ($debugMarkers) {

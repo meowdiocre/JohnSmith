@@ -1,254 +1,108 @@
 # Intel VMX/EPT architecture
 
-Implementation map for `src/intel.c`, `src/intel/`, `include/intel.h`, and
-`asm/intel.asm`.
+Implementation map for `src/intel.c`, `src/intel/`, `include/intel.h`,
+`include/hook_observe.h`, `src/hook_*.c`, `asm/intel.asm`, and
+`asm/hook_dispatch.asm`.
 
 Normative source: [Intel SDM combined volumes, version 092](../../static/docs/325462-092-sdm-vol-1-2abcd-3abcd-4.pdf),
-primarily Volume 3C. Section numbers below refer to that revision.
+primarily Volume 3C.
 
-## Required platform state
+## Platform gates
 
-| Requirement | Project policy | SDM location |
-| --- | --- | --- |
-| VMX support | Require `CPUID.01H:ECX.VMX` | VMX capability discovery |
-| Firmware enable | Require locked `IA32_FEATURE_CONTROL` with VMX enabled outside SMX | VMX enablement |
-| VMX regions | Allocate below 4 GiB when required; write runtime revision ID | VMCS and VMXON regions |
-| EPT | Require page-walk length 4, WB EPTP, 2 MiB pages, and INVEPT | Section 31.3; `IA32_VMX_EPT_VPID_CAP` |
-| natively exposed features | Enable RDTSCP, INVPCID, XSAVES, and VPID only when controls permit | Appendix A capability MSRs |
-| CET | Permit `CR4.CET=1` only while `IA32_S_CET=0` | CET state and VM-entry/exit controls |
+The backend requires VMX, firmware-enabled `IA32_FEATURE_CONTROL`, valid VMX
+fixed bits, EPT, a four-level WB EPT pointer, 2 MiB EPT pages, and INVEPT.
+VMXON and VMCS regions receive the runtime revision identifier and are placed
+below 4 GiB when `IA32_VMX_BASIC` requires it.
 
-All control words are adjusted with the low/high halves of the relevant
-capability MSR. Capability-mandated one bits are valid even when they were not
-part of the requested functional set. Required behaviors are checked after
-adjustment.
+Control words are adjusted through their capability MSRs. VM entry and exit
+save or restore debug controls, PAT, EFER, and 64-bit host state. Secondary
+controls enable EPT and conditionally enable RDTSCP, VPID, INVPCID, and XSAVES.
 
-## Active controls
+## VMCS and exit pipeline
 
-| Class | Required behavior |
-| --- | --- |
-| Primary execution | Secondary controls and MSR bitmaps |
-| Secondary execution | EPT; optional RDTSCP, VPID, INVPCID, and XSAVES |
-| VM exit | 64-bit host, save debug controls, save/load PAT, save/load EFER |
-| VM entry | IA-32e guest, load debug controls, load PAT, load EFER |
+Each processor owns a VMXON region, VMCS, MSR bitmap, host stack, cached CPUID
+policy, VPID, EPT views, exit history, and hypercall-page registration.
 
-External-interrupt exiting and acknowledge-interrupt-on-exit are not requested.
-The VM-exit/entry MSR-list counts are zero. PAT and EFER use their dedicated
-controls; moving them to generic MSR lists would add list processing and would
-not remove their required guest/host transition semantics.
+The VM-exit path:
 
-## VMCS ownership
+1. Preserves guest GPRs and ABI-volatile XMM registers.
+2. Reads the exit reason, qualification, instruction length, and guest state.
+3. Restores a valid IDT-vectoring event.
+4. Synchronizes the active EPT view generation.
+5. Handles CPUID, control-register, MSR, VMX-instruction, EPT, and stop exits.
+6. Advances RIP only for completed instruction emulation.
+7. Restores state and executes `VMRESUME`.
 
-The guest/host masks own only VMX-fixed CR0/CR4 positions plus `CR4.VMXE`:
+Unknown exits and invalid transition states use distinct fail-stop signatures.
 
-```text
-CR0 mask = IA32_VMX_CR0_FIXED0 | ~IA32_VMX_CR0_FIXED1
-CR4 mask = IA32_VMX_CR4_FIXED0 | ~IA32_VMX_CR4_FIXED1 | CR4.VMXE
-```
+## CPUID policy
 
-Read shadows preserve the values visible to the guest. `FIXED0 ^ FIXED1` is
-not an ownership mask; it selects flexible positions.
-
-Teardown reconstructs each guest-visible control register as
-`(guest field & ~mask) | (read shadow & mask)`. Mask-zero positions are
-guest-owned and must not be restored from stale read shadows.
-
-`VMCLEAR` precedes the initial VMCS population. Guest interruptibility and
-pending-debug fields are initialized once before `VMLAUNCH`, then updated only
-when exit semantics require it.
-
-## Exit pipeline
-
-The slow path performs these operations in order:
-
-1. Preserve guest GPRs and ABI-volatile XMM0-XMM5.
-2. Read and validate the raw exit reason, instruction length, and guest RIP.
-3. Restore a valid IDT-vectoring event for the next entry.
-4. Synchronize EPT generation before dispatch.
-5. Emulate the classified exit or fail-stop for an unsupported reason.
-6. Consume interruptibility/debug state and advance guest RIP when appropriate.
-7. Restore registers and execute `VMRESUME`.
-
-VM-entry failure bit 31 in the raw exit reason is checked before reason-specific
-handling. Unknown reasons are not converted into a generic exception because
-qualification, retry, and RIP semantics are exit-specific.
-
-## CPUID fast path
-
-CPUID unconditionally exits in VMX non-root operation (Section 28.1.2). There
-is no execution control that disables that exit.
-
-Release builds attempt an assembly fast path after saving four scratch
-registers. Direct resume is allowed only when all of the following hold:
-
-- EPT generation is current.
-- No valid IDT-vectoring event exists.
-- STI and MOV-SS blocking are clear.
-- `RFLAGS.TF=0`.
-- The guest is executing in a 64-bit code segment (`CS.L=1`).
-- The leaf/subleaf does not require a project feature mask.
-
-Leaf 0 is returned from a per-CPU cache. Other eligible leaves execute native
-root-mode CPUID. Any failed guard reaches the C path before guest-visible state
-is changed.
-
-Feature masks are prepared during VMCS setup:
-
-- leaf 1 hides VMX and other policy-controlled features;
-- leaf 7 subleaf 0 reflects INVPCID availability;
-- leaf `0xD` subleaf 1 reflects XSAVES availability;
-- leaf `0x80000001` reflects RDTSCP availability.
-
-Topology, APIC ID, OSXSAVE, XCR0, and XSS-dependent results are not globally
-cached.
-
-## Events, debug state, and RIP
-
-VM exits clear the valid bit in the VM-entry interruption-information field
-(Section 27.8.3). The handler therefore reconstructs only events reported by
-the IDT-vectoring fields.
-
-Successful instruction emulation consumes saved STI/MOV-SS blocking as required
-by Section 29.7.1. If `RFLAGS.TF=1` and `IA32_DEBUGCTL.BTF=0`, it sets pending
-debug `BS` as required by Section 29.7.3. Existing pending causes are preserved.
-Hardware exceptions use SDM Table 7-4 classes. Double-fault pairs replace the
-restored event with `#DF`; serial pairs keep the already restored event.
-
-RIP advancement follows Section 29.3.1.4:
-
-- use 64-bit arithmetic when `CS.L=1`;
-- use zero-extended EIP when `CS.L=0` and `CS.D=1`;
-- update only IP bits 15:0 when `CS.L=0` and `CS.D=0`.
-
-Interrupt-window and NMI-window injection are **not implemented features**.
-One-slot request/handler scaffold code remains in `intel_exit.c` and
-`intel.h`, but it has no producer. In particular, the NMI request path must not
-be called: it can enable NMI-window exiting without enabling NMI exiting and
-virtual NMIs. See the audited status and removal/rework requirement in
-[`../implementation-status.md`](../implementation-status.md).
-
-## Control-register emulation
-
-CR0 and CR4 writes combine guest-visible values with VMX fixed-bit constraints.
-MOV-to-CR3 normally does not exit, but the handler remains correct if a
-capability-mandated control causes interception.
-
-With `CR4.PCIDE=1`, source bit 63 suppresses invalidation and is stripped before
-VMWRITE because architectural CR3 bit 63 remains zero. Without PCID, source bit
-63 produces guest `#GP`. Ordinary emulated CR3 loads issue single-context
-INVVPID when VPID is active.
+CPUID exits are emulated. The policy hides VMX exposure, applies the enabled
+INVPCID, XSAVES, and RDTSCP masks, and preserves native topology and
+OS-dependent results. Release and Benchmark configurations can use the
+assembly fast path when its EPT, event, debug, and code-segment guards pass.
 
 ## EPT and VPID
 
-The identity EPT covers at most 512 GiB. RAM uses WB memory type; non-RAM uses
-UC. Mixed 2 MiB regions are split into 4 KiB PTEs. EPT violations and EPT
-misconfigurations are distinct fail-stop conditions; an EPT violation is not a
-guest page fault.
+The identity EPT maps up to 512 GiB. RAM uses WB memory type and non-RAM uses
+UC. Uniform ranges use 2 MiB leaves; mixed memory maps, per-page permissions,
+and hook pages use 4 KiB page tables.
 
-Every 4 KiB split records the reason it was created:
+Each processor owns primary and secondary EPT views with independent
+generation counters. Mapping changes increment the backend generation and
+rendezvous active processors. The callback uses single-context INVEPT when the
+CPU supports it and all-context INVEPT otherwise.
 
-- `INTEL_SPLIT_REASON_MIXED_MEMORY_MAP` for boot-time RAM/MMIO splits. These
-  carry heterogeneous memory types and are never eligible for merge because a
-  single 2 MiB leaf cannot represent both WB and UC coverage.
-- `INTEL_SPLIT_REASON_PERMISSION` for runtime per-page permission changes.
-  These are the only splits eligible for merge, and only when all 512 PTEs
-  return to identical address, permission, and memory-type attributes.
-- `INTEL_SPLIT_REASON_HOOK` for splits that back a Stage 4 hook. These are
-  never eligible for merge while the split exists; the merge helper refuses
-  to collapse them even after the PTEs are restored on remove, at the cost
-  of holding one 4 KiB PT per hooked 2 MiB region until backend teardown.
+Per-CPU VPIDs start at one. INVVPID is used for emulated CR3 updates when VPID
+is active.
 
-An EPT violation decoder converts the exit qualification into read/write/execute
-access intent, EPT-visible readable/writable/executable state, and
-linear-address validity. The linear address is consumed only when qualification
-bit 7 is set. The current handler consults the hook policy table before any
-fail-stop, so a synthetic guest `#PF` is never fabricated without a validated
-policy and per-vCPU CR2 virtualization in place.
+## Execute hooks
 
-### Dual-EPT hook views
+`IntelHookInstall` validates the target GPA and patch range, prepares the
+target page in every processor's primary and secondary views, copies the
+original page into contiguous shadow memory, and applies the patch bytes.
 
-> [!CAUTION]
-> The backend callbacks are disabled. The checked-in implementation has
-> publication races, divergent roots, target-policy weakening, and no complete
-> RAM/MMIO/cache policy.
+The primary view keeps the original page readable and writable without execute
+permission. The secondary view maps the shadow page execute-only. EPT
+violations switch the active view and retry the guest instruction without RIP
+advancement.
 
-The checked-in implementation attaches a second `INTEL_EPT_ROOT` (`HookRoot`)
-and builds a new identity R/W map. It is not a deep copy and is not synchronized
-with primary remaps or later permission changes. While a vCPU uses this root,
-unrelated data accesses can bypass primary-root policy.
+Hook policies are stored in a fixed slot table and GPA hash. Installation and
+removal serialize mutations, rendezvous all active processors, restore original
+PTEs on removal, retire secondary views, and reclaim per-CPU page-table pages
+after lock-free readers have crossed an invalidation boundary.
 
-For each installed hook:
+`ObserveHookInstall` builds a trampoline for the displaced instructions and a
+fixed-size thunk that enters `AsmHookDispatcher`. `HookObserveDispatch`
+increments the hit counter, calls the registered callback, and returns the
+trampoline address. Query and list operations expose the hook ID, GPA, cookie,
+active state, and hit count.
 
-- the primary root's 4 KiB PTE is rewritten from RWX to R+W with the memory
-  type preserved, so data reads and writes still see the original bytes but
-  fetches trap;
-- the hook root's 4 KiB PTE is rewritten to X-only pointing at a fresh
-  cached shadow page whose contents are a copy of the original page with the
-  caller-supplied patch bytes applied.
+## Control transport
 
-The EPT-violation handler serves three transitions:
+`DriverEntry` reads `Parameters\HypercallSeed`, restricts the service and
+parameters registry keys to SYSTEM and Administrators, and starts the
+hypervisor.
 
-- execute violation on a hooked GPA from the primary root switches to the
-  hook root and retries without advancing RIP; the guest fetches the patched
-  bytes;
-- data violation on a hooked GPA from the hook root switches back to the
-  primary root and retries; the guest reads or writes the original bytes;
-- execute violation on the hook root outside any hooked GPA switches back to
-  the primary root and retries; control has left the shadow page and belongs
-  on the original view again.
+The seed derives CPUID subleaves and command identifiers with FNV-1a. A client
+registers one page on its selected processor. The worker locks that user page
+with an MDL and services these commands:
 
-Any policy match that reaches an unswitchable state fail-stops with
-`INTEL_BUGCHECK_EPT_VIOLATION` carrying `(Cookie, Kind)` in bugcheck
-parameter 4. Execute-only leaves require `IA32_VMX_EPT_VPID_CAP[0]`;
-installation refuses to run when that bit is clear.
+- register shared page;
+- install, remove, query, and list hooks;
+- read and write memory;
+- invoke the hook probe.
 
-Each pinned CPU receives a nonzero processor-local VPID when supported. Live
-EPT changes increment a shared generation and rendezvous every active CPU.
-Each CPU performs single-context INVEPT when supported, otherwise all-context
-INVEPT, before accepting the new generation. `IntelSwitchActiveEptRoot`
-writes `VMCS_EPT_POINTER`, updates the vCPU's cached `EptPointer`, resets its
-generation counter to force mismatch on the next check, and then invokes the
-same INVEPT path so the newly-loaded root sees no stale translations.
-
-Install changes PTEs before publishing the policy slot. Removal unpublishes the
-slot before setting force-primary. A vCPU can therefore observe a legitimate
-hook violation without a matching policy and reach fail-stop handling. Target
-pages are also changed to primary R/W and shadow X without proving that the
-original permission and memory-type policy permits this transformation.
-
-## MSR and nested-VMX policy
-
-The bitmap intercepts `IA32_FEATURE_CONTROL`, VMX capability MSRs, and the
-supervisor-CET policy MSR. VMX is hidden from CPUID; intercepted VMX capability
-reads and unsupported accesses receive `#GP`. Guest VMX instructions receive
-`#UD`. Nested VMX is not implemented.
+Process-exit notification releases registered pages. Hypervisor teardown stops
+the worker, drains rundown protection, removes hooks, resets thunk storage, and
+frees processor EPT views.
 
 ## Teardown and diagnostics
 
 Before VMXOFF, the stop path captures current guest control, debug, descriptor,
-PAT, EFER, SYSENTER, FS, and GS state. VM exit sets GDTR/IDTR limits to `0xFFFF`
-(Section 30.5.2), so both bases and limits are restored after VMXOFF.
+PAT, EFER, SYSENTER, FS, and GS state. The assembly return path restores that
+state after leaving VMX operation.
 
-Debug builds retain a bounded per-CPU exit history. Unexpected exit, event
-collision, EPT violation, EPT misconfiguration, and invalidation failures use
-distinct bugcheck signatures. Release builds remove history collection from
-the hot path.
-
-## Control device
-
-`\Device\JohnSmith` and `\DosDevices\JohnSmith` provide a versioned IOCTL
-surface. The device ACL grants read/write access to
-SYSTEM and BUILTIN\\Administrators only. `IOCTL_JOHNSMITH_STATUS` returns the
-lifecycle, backend name, CPU counts, and the ABI version from
-`include/johnsmith_ioctl.h`. Hook install/remove/query request definitions and
-handlers remain, but the Intel backend callbacks are disabled, so requests
-return `STATUS_NOT_SUPPORTED`. Each handler holds rundown protection on the
-published hypervisor; unload blocks new requests and waits for in-flight
-requests before stop. HPA, GPA, GVA, translate, and other physical-memory
-IOCTLs are not implemented.
-
-## Deliberate exclusions
-
-- TSC offset remains zero; RDTSC/RDTSCP execute natively.
-- Post-boot INIT is dropped because processor reset/hotplug is unsupported.
-- Root supervisor CET and shadow-stack state are not implemented.
-- Recoverable EPT-policy emulation and nested VMX are not implemented.
+Debug builds retain bounded per-CPU VM-exit history. EPT violations, EPT
+misconfigurations, event collisions, invalidations, and unexpected exits use
+separate bugcheck signatures.

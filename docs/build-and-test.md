@@ -77,17 +77,16 @@ the handler.
 
 ## Verification matrix
 
-| Check | Intel | AMD | Build-only acceptable? |
-| --- | --- | --- | --- |
-| Support probe | Required | Required | No |
-| All-CPU launch | Required | Required | No |
-| Rollback after injected failure | Required | Required | No |
-| Live SLAT permission change | INVEPT generation | VMMCALL/TLB_CONTROL generation | No |
-| CPUID policy | Masked/emulated | Masked/emulated | No |
-| Execute hooks | Dual-EPT install/remove/query | Unsupported | No |
-| Teardown/state restoration | Required | Required | No |
-| Debug/Release/Benchmark compile | Required | Required | Yes |
-| WDK analysis | Required | Required | Yes |
+| Check | Scope | Build-only acceptable? |
+| --- | --- | --- |
+| Support probe | Intel and AMD | No |
+| All-CPU launch and rollback | Intel and AMD | No |
+| Live SLAT permission change | Intel INVEPT and AMD VMMCALL/TLB_CONTROL | No |
+| CPUID policy | Intel and AMD | No |
+| Execute-hook install/remove/query | Intel | No |
+| Teardown and state restoration | Intel and AMD | No |
+| Debug/Release/Benchmark compile | Solution | Yes |
+| WDK analysis | Driver | Yes |
 
 AMD compilation on an Intel system is not AMD runtime proof. Keep that boundary
 explicit in reviews and release notes.
@@ -98,7 +97,7 @@ explicit in reviews and release notes.
 - [ ] Release WDK analysis passes.
 - [ ] Project XML and PowerShell scripts parse.
 - [ ] `git diff --check` passes.
-- [ ] New intercepts have a complete handler and exception policy.
+- [ ] Enabled intercepts have a complete handler and exception policy.
 - [ ] Assembly-visible layouts have compile-time assertions.
 - [ ] Manual revision and section are cited.
 - [ ] Hardware results identify artifact, platform, and configuration.

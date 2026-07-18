@@ -5,121 +5,57 @@ Implementation map for `src/amd.c`, `src/amd/`, `include/amd.h`, and
 
 Normative source: [AMD64 APM Volume 2, publication 24593 revision 3.44](../../static/docs/24593_3.44_APM_Vol2.pdf).
 
-## Required platform state
+## Platform gates
 
-| Requirement | Project policy | APM location |
-| --- | --- | --- |
-| SVM | Require `CPUID.80000001H:ECX.SVM` | SVM feature discovery |
-| Firmware | Reject `VM_CR.SVMDIS=1` | `VM_CR` |
-| SVM revision | Require nonzero `CPUID.8000000AH:EAX` | Section 15.4 |
-| ASIDs | Require at least host ASID 0 and one guest ASID | `CPUID Fn8000_000A` |
-| Nested paging | Require NPT | Section 15.25 |
-| Next RIP | Require NRIPS | VMCB `nRIP` support |
-| CET | Reject `CR4.CET=1` | Project safety policy |
+The backend requires SVM, an enabled `VM_CR`, a nonzero SVM revision, at least
+one guest ASID, nested paging, and NRIPS. Assembly-visible VMCB fields have
+compile-time offset assertions.
 
-Every assembly-visible VMCB field has a compile-time offset assertion. Required
-SVM/VMCB features and guest-writable EFER enable bits are gated by AMD CPUID;
-no VMCB field or clean bit is inferred from an Intel encoding.
+## VMCB and intercept policy
 
-## VMCB policy
+Each processor owns guest and host VMCBs, host-save memory, an MSR permission
+map, a host stack, guest ASID, SLAT generation, and captured teardown state.
 
-The guest VMCB captures segment, control, debug, syscall, PAT, EFER, and
-descriptor state. The backend enables:
+The VMCB enables nested paging and intercepts CPUID, selected MSRs, INVLPGA,
+SVM instructions, and XSETBV. CPUID emulation hides hypervisor, VMX, SVM, and
+SVM-capability exposure while preserving native topology and OS-dependent
+results.
 
-- nested paging;
-- MSR permission-map interception;
-- CPUID interception with native-result feature masking;
-- INVLPGA interception;
-- SVM-instruction interception;
-- XSETBV interception when XSAVE is present; requests currently receive `#GP` until guest XCR0 and host XCR0 are preserved separately.
-
-The CPUID handler executes the requested native leaf/subleaf, clears hypervisor
-and VMX exposure from leaf 1, clears SVM from `0x80000001`, and zeros the SVM
-capability leaf `0x8000000A`. It advances to `NextRip` only after completing the
-emulation. AMD bare-metal validation remains required.
-
-I/O interception is disabled until the project owns an explicit port policy.
-An allocated all-zero IOPM would add state without changing behavior.
+MSR handling virtualizes EFER, `VM_CR`, and `VM_HSAVE_PA`. EFER writes are
+gated by their CPUID feature bits. `VM_CR` writes enforce reserved, lock, and
+disable semantics; `VM_HSAVE_PA` writes enforce alignment and physical-width
+constraints. Intercepted SVM instructions and INVLPGA inject `#UD`; XSETBV
+injects `#GP`.
 
 ## Entry and exit pipeline
 
-`AmdAsmLaunch` saves the host VMCB, establishes a dedicated host stack, loads
-guest state, enables GIF, and executes VMRUN. On exit it saves the guest VMCB,
-restores the host VMCB, preserves GPRs and ABI-volatile XMM state, then calls the
-C dispatcher.
+`AmdAsmLaunch` saves host state, establishes the host stack, loads guest state,
+enables GIF, and executes VMRUN. VM exit saves the guest VMCB, restores the
+host VMCB, preserves GPRs and ABI-volatile XMM registers, and calls the C
+dispatcher.
 
-The handler:
+The dispatcher consumes pending NPT invalidation, restores `EXITINTINFO`,
+handles the exact exit code, advances to `nRIP` for completed emulation, and
+updates VMCB clean bits. Unexpected exits, nested page faults, invalidation
+failures, and event collisions use separate fail-stop signatures.
 
-1. Consumes any pending NPT generation into `TLB_CONTROL`.
-2. Restores valid `EXITINTINFO` into `EVENTINJ`.
-3. Dispatches the exact exit code.
-4. Advances to `nRIP` only for successfully emulated instructions.
-5. Clears relevant VMCB clean state after software changes cached fields.
+## NPT and ASIDs
 
-Unknown exits and unexpected nested page faults fail-stop with exit information
-and RIP preserved for diagnosis.
+The identity NPT maps up to 512 GiB. Cache flags are derived from the active
+PAT. Uniform ranges use 2 MiB entries; mixed RAM and non-RAM ranges use 4 KiB
+page tables.
 
-## ASIDs and TLB invalidation
+Runtime permission changes increment a shared generation and rendezvous active
+processors through a signature-gated CPL0 VMMCALL. Each VMCB consumes the
+generation with `TLB_CONTROL=3` when flush-by-ASID is available and
+`TLB_CONTROL=1` otherwise.
 
-`CPUID Fn8000_000A.EBX` is an ASID count including reserved host ASID zero.
-Valid guest ASIDs are `1..AsidCount-1`. Because each VMCB remains pinned to one
-logical processor, numeric ASIDs need not be globally unique.
+Guest ASIDs use the range `1..AsidCount-1`. Each VMCB remains pinned to its
+logical processor.
 
-Live NPT changes increment a shared generation and execute an IPI rendezvous.
-The callback uses a private signature-gated CPL0 VMMCALL rather than CPUID. The
-exit handler observes the generation before dispatch and selects:
+## Teardown
 
-- `TLB_CONTROL=3` when flush-by-ASID is enumerated;
-- `TLB_CONTROL=1` otherwise.
-
-The ASID clean bit is cleared before VMRUN, and the post-rendezvous generation
-check proves that every active CPU consumed the update.
-
-## NPT
-
-The identity NPT covers at most 512 GiB. Physical RAM and non-RAM cache flags
-are derived from the active PAT. Fully uniform 2 MiB ranges use large entries;
-mixed ranges are split into 4 KiB entries.
-
-An NPF represents a second-level translation or permission failure, not a guest
-page fault. JohnSmith has no recoverable NPF policy/emulator, so unexpected NPF
-exits fail-stop with `EXITINFO1`, `EXITINFO2`, and RIP.
-
-## Events and instruction policy
-
-The handler will not overwrite a valid pending injection. A collision between
-an event already selected for `EVENTINJ` and a new exception is a fail-stop
-condition.
-
-CPUID policy hides hypervisor, VMX, and SVM exposure while retaining native
-topology and OS-dependent results. MSRPM policy virtualizes EFER, VM_CR, and
-VM_HSAVE_PA while rejecting unsupported intercepted accesses with `#GP`. EFER
-SCE, NXE, LMSLE, FFXSR, TCE, MCOMMIT, INTWB, UAIE, and AIBRSE writes are gated
-by their documented CPUID fields. VM_CR writes enforce reserved-bit and
-LOCK/SVMDIS semantics; VM_HSAVE_PA writes enforce alignment and physical-width
-constraints.
-Guest SVM instructions and INVLPGA receive `#UD`; nested SVM is not implemented.
-XSETBV receives `#GP` until transition code owns separate host and guest XCR0.
-
-## Host state and teardown
-
-VMRUN/VMEXIT automatic state is supplemented by VMSAVE/VMLOAD for state not
-covered by the automatic transition. Teardown reconstructs current Windows
-control/debug state from the guest VMCB, restores PAT, EFER, and VM_HSAVE_PA,
-reenables GIF, and returns to the captured `nRIP`/RSP.
-
-## Speculation-control boundary
-
-[AMD publication 111006-B](../../static/docs/111006-amd-hypervisor-speculation.pdf)
-describes separate host and guest `SPEC_CTRL` behavior on VMRUN/VMEXIT for CPUs
-that enumerate the facility. JohnSmith does not yet model the corresponding
-VMCB state and makes no claim that this older paper applies to every supported
-AMD CPU. Any future implementation must first verify current APM fields, CPUID
-enumeration, and processor errata.
-
-## Deliberate exclusions
-
-- Nested SVM instructions are rejected rather than virtualized.
-- I/O virtualization and a device model are absent.
-- AMD CET/SSP state virtualization is absent.
-- Recoverable NPF emulation and nested SVM are absent.
+VMRUN and VMEXIT automatic state is supplemented by VMSAVE and VMLOAD. The
+stop path reconstructs Windows control and debug state from the guest VMCB,
+restores PAT, EFER, and `VM_HSAVE_PA`, enables GIF, and returns to the captured
+RIP and RSP.
