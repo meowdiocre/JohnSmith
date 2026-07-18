@@ -1,5 +1,6 @@
 #include "intel/intel_internal.h"
 #include "hv_log.h"
+#include "hook_observe.h"
 
 static NTSTATUS
 IntelValidateSupervisorCet(
@@ -152,11 +153,22 @@ IntelPrepare(
     context->VmxBasic = __readmsr(IA32_VMX_BASIC);
     context->EptVpidCapabilities = __readmsr(IA32_VMX_EPT_VPID_CAP);
     context->SlatGeneration = 1;
-    /* No hooks after prepare; secondary root is created lazily. */
+
+    status = IntelHypercallPrepare();
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
+        return status;
+    }
+
+    HookThunkInitialize();
     IntelHookResetTable();
+
     State->BackendContext = context;
 
     status = IntelBuildEpt(context);
+    if (NT_SUCCESS(status)) {
+        status = IntelHookEnsureSecondaryRoot(context);
+    }
     if (!NT_SUCCESS(status)) {
         IntelFreeEpt(context);
         ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
@@ -177,6 +189,7 @@ IntelFree(
     }
     context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
     IntelHookTeardown();
+    ObserveHookReset();
     IntelFreeEpt(context);
     ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
     State->BackendContext = NULL;
@@ -190,6 +203,8 @@ IntelDestroyCpuContext(
     if (Context == NULL) {
         return;
     }
+    IntelHypercallReleasePage(Context);
+    IntelFreeCpuEptViews(Context);
     if (Context->HostStack != NULL) {
         RtlSecureZeroMemory(Context->HostStack, INTEL_HOST_STACK_SIZE);
         ExFreePoolWithTag(Context->HostStack, HV_POOL_TAG_BACKEND);
@@ -215,6 +230,7 @@ IntelPrepareCpu(
 {
     INTEL_BACKEND_CONTEXT* backend;
     INTEL_CPU_CONTEXT* context;
+    NTSTATUS status;
 
     if (State == NULL || Cpu == NULL || State->BackendContext == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -226,6 +242,7 @@ IntelPrepareCpu(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(context, sizeof(*context));
+    ExInitializeRundownProtection(&context->HypercallPageRundown);
 
     context->Vmxon = IntelAllocatePage(MAXULONG);
     context->Vmcs = IntelAllocatePage(MAXULONG);
@@ -248,6 +265,11 @@ IntelPrepareCpu(
     IntelInitializeMsrBitmap((UCHAR*)context->MsrBitmap);
     *(ULONG*)context->Vmxon = (ULONG)(backend->VmxBasic & 0x7fffffffu);
     *(ULONG*)context->Vmcs = (ULONG)(backend->VmxBasic & 0x7fffffffu);
+    status = IntelInitializeCpuEptViews(context, backend);
+    if (!NT_SUCCESS(status)) {
+        IntelDestroyCpuContext(context);
+        return status;
+    }
     Cpu->VendorContext = context;
     return STATUS_SUCCESS;
 }
@@ -516,11 +538,9 @@ static const HV_BACKEND_OPS IntelBackendOps = {
     IntelReportStartFailure,
     IntelQueryOwnedPageAccess,
     IntelSetOwnedPageAccess,
-    /* ponytail: Re-enable only after transactional dual-root publication,
-       permission preservation, RAM/MMIO policy, and concurrency tests. */
-    NULL,
-    NULL,
-    NULL
+    IntelHookInstall,
+    IntelHookRemove,
+    IntelHookQuery
 };
 
 const HV_BACKEND_OPS*

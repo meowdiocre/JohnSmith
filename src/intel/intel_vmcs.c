@@ -108,6 +108,7 @@ IntelSetupVmcs(
     ULONG exitControls;
     ULONG entryControls;
     ULONG desiredSecondary;
+    ULONG desiredPin;
     ULONG requiredSecondary;
     ULONG desiredPrimary;
     ULONG requiredExit;
@@ -151,6 +152,7 @@ IntelSetupVmcs(
     entryMsr = (backend->VmxBasic & (1ull << 55)) != 0
         ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS;
 
+    desiredPin = 0;
     desiredSecondary = VMX_SECONDARY_ENABLE_EPT;
     requiredSecondary = VMX_SECONDARY_ENABLE_EPT;
     __cpuid(cpuid, 0x80000000);
@@ -166,6 +168,32 @@ IntelSetupVmcs(
     context->CpuidLeaf0Ebx = (ULONG)cpuid[1];
     context->CpuidLeaf0Ecx = (ULONG)cpuid[2];
     context->CpuidLeaf0Edx = (ULONG)cpuid[3];
+
+    /*
+     * Hypercall clamped return.  The trigger is CPUID leaf 1 with a per-boot
+     * subleaf; on the target CPU leaf 1 ignores ECX (verified: every subleaf
+     * returns the identical leaf-1 block on bare metal).  The clamped return
+     * therefore must reproduce the masked leaf-1 block, not CPUID(max_std,0),
+     * or an anti-cheat comparing CPUID(1, magic_subleaf) to CPUID(1, 0) would
+     * see differing EAX/EBX/ECX/EDX and detect the trap.  The mask clears
+     * VMX (bit 5) and the hypervisor-present bit (bit 31), matching the
+     * existing case 1 handler in intel_exit.c.
+     */
+    __cpuidex(cpuid, 1, 0);
+    context->ClampedCpuidEax = (ULONG)cpuid[0];
+    context->ClampedCpuidEbx = (ULONG)cpuid[1];
+    context->ClampedCpuidEcx = (ULONG)cpuid[2] & 0x7FFFFFDFu;
+    context->ClampedCpuidEdx = (ULONG)cpuid[3];
+
+    context->Hypercall1GbPagesSupported = FALSE;
+    __cpuid(cpuid, 0x80000000);
+    if ((ULONG)cpuid[0] >= 0x80000001u) {
+        __cpuidex(cpuid, 0x80000001, 0);
+        if ((((ULONG)cpuid[3]) & (1u << 26)) != 0) {
+            context->Hypercall1GbPagesSupported = TRUE;
+        }
+    }
+
     if (maxBasicLeaf >= 7) {
         __cpuidex(cpuid, 7, 0);
         if ((((ULONG)cpuid[1]) & (1u << 10)) != 0) {
@@ -186,7 +214,7 @@ IntelSetupVmcs(
 
     desiredPrimary = VMX_PRIMARY_ACTIVATE_SECONDARY |
                      VMX_PRIMARY_USE_MSR_BITMAPS;
-    pinControls = IntelAdjustControls(0, pinMsr);
+    pinControls = IntelAdjustControls(desiredPin, pinMsr);
     primaryControls = IntelAdjustControls(
         desiredPrimary, primaryMsr);
     secondaryControls = IntelAdjustControls(
@@ -207,6 +235,9 @@ IntelSetupVmcs(
     context->EntryControls = entryControls;
     context->DesiredPrimaryControls = desiredPrimary;
     context->DesiredSecondaryControls = desiredSecondary;
+    context->VirtualNmiEnabled =
+        (pinControls & (VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS)) ==
+        (VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS);
     context->RequiredSecondaryControls = requiredSecondary;
     context->RequiredExitControls = requiredExit;
     context->RequiredEntryControls = requiredEntry;
@@ -236,7 +267,7 @@ IntelSetupVmcs(
         return STATUS_HV_FEATURE_UNAVAILABLE;
     }
 
-    eptp = backend->PrimaryRoot.EptPointer;
+    eptp = context->PrimaryEpt.EptPointer;
     context->EptPointer = eptp;
     context->Vpid = (secondaryControls & VMX_SECONDARY_ENABLE_VPID) != 0
         ? (USHORT)(Cpu->ProcessorIndex + 1) : 0;

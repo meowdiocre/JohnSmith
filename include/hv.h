@@ -10,6 +10,9 @@ typedef struct _HV_BACKEND_OPS HV_BACKEND_OPS;
 #define HV_POOL_TAG_BACKEND         'kBvH'
 #define HV_POOL_TAG_SLAT_SPLIT      'tSvH'
 #define HV_POOL_TAG_HOOK            'kHvH'
+#define HV_POOL_TAG_HOOK_POLICY     'pHvH'
+#define HV_POOL_TAG_HOOK_META       'mHvH'
+#define HV_POOL_TAG_HOOK_CODE       'cHvH'
 
 #define HV_SLAT_MAXIMUM_ADDRESS     (512ull * 1024ull * 1024ull * 1024ull)
 #define HV_HYPERCALL_MAGIC_RAX      0x31504F5453564E45ull
@@ -81,7 +84,7 @@ struct _HV_BACKEND_OPS {
         _In_reads_bytes_(PatchSize) const VOID* PatchBytes,
         _In_ ULONG PatchOffset,
         _In_ ULONG PatchSize,
-        _In_ ULONG Cookie,
+        _In_ ULONG64 Cookie,
         _Out_ ULONG* HookId);
     NTSTATUS (*HookRemove)(
         _Inout_ HV_STATE* State,
@@ -91,7 +94,7 @@ struct _HV_BACKEND_OPS {
         _In_ ULONG HookId,
         _Out_ ULONG* Valid,
         _Out_ ULONG* Kind,
-        _Out_ ULONG* Cookie,
+        _Out_ ULONG64* Cookie,
         _Out_ ULONG64* GuestPhysicalAddress,
         _Out_ ULONG64* ShadowHostPhysicalAddress);
 };
@@ -110,6 +113,16 @@ struct _HV_STATE {
     ULONG CpuCount;
     volatile LONG Lifecycle;
 };
+
+BOOLEAN
+HvTryAcquireForWorker(
+    _Out_ HV_STATE** OutState
+    );
+
+VOID
+HvReleaseForWorker(
+    VOID
+    );
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS

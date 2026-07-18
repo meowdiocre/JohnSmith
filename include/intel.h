@@ -63,6 +63,24 @@ typedef struct _INTEL_EXIT_RECORD {
     ULONG RawReason;
 } INTEL_EXIT_RECORD;
 
+typedef struct _INTEL_CPU_EPT_SPLIT {
+    LIST_ENTRY Link;
+    ULONG PdptIndex;
+    ULONG PdIndex;
+    volatile LONG ReferenceCount;
+    PVOID Pt;
+} INTEL_CPU_EPT_SPLIT;
+
+typedef struct _INTEL_CPU_EPT_VIEW {
+    PVOID Pml4;
+    PVOID Pdpt;
+    PVOID Pds[512];
+    ULONG PdHookCount[512];
+    LIST_ENTRY SplitList;
+    ULONG64 EptPointer;
+    volatile LONG64 SlatGeneration;
+} INTEL_CPU_EPT_VIEW;
+
 typedef struct _INTEL_CPU_CONTEXT {
     PVOID Vmxon;
     PVOID Vmcs;
@@ -81,6 +99,8 @@ typedef struct _INTEL_CPU_CONTEXT {
     PVOID BackendContext;
     PHYSICAL_ADDRESS MsrBitmapPhysical;
     ULONG64 EptPointer;
+    INTEL_CPU_EPT_VIEW PrimaryEpt;
+    INTEL_CPU_EPT_VIEW SecondaryEpt;
     volatile LONG64 SlatGeneration;
     ULONG64 StopCookie;
     ULONG LastVmxError;
@@ -119,12 +139,23 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG CpuidLeaf0Ebx;
     ULONG CpuidLeaf0Ecx;
     ULONG CpuidLeaf0Edx;
+    ULONG ClampedCpuidEax;
+    ULONG ClampedCpuidEbx;
+    ULONG ClampedCpuidEcx;
+    ULONG ClampedCpuidEdx;
+    EX_RUNDOWN_REF HypercallPageRundown;
+    PMDL HypercallPageMdl;
+    PVOID HypercallSharedPage;
+    PEPROCESS HypercallOwnerProcess;
+    BOOLEAN HypercallPageRegistered;
+    BOOLEAN Hypercall1GbPagesSupported;
     volatile LONG64 ExitSequence;
     volatile LONG64 CompletedExitSequence;
     ULONG64 LastExitEntryTsc;
     ULONG64 LastExitCompletionTsc;
 
     volatile LONG PendingNmi;
+    BOOLEAN VirtualNmiEnabled;
     volatile LONG PendingInterruptValid;
     UCHAR PendingInterruptVector;
     INTEL_EXIT_RECORD ExitHistory[INTEL_EXIT_HISTORY_COUNT];

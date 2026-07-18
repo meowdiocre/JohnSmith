@@ -140,12 +140,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\common\x86_common.c" />
-    <ClCompile Include="src\device.c" />
     <ClCompile Include="src\driver.c" />
     <ClCompile Include="src\hv.c" />
     <ClCompile Include="src\log.c" />
     <ClCompile Include="src\intel.c" />
     <ClCompile Include="src\intel\intel_exit.c" />
+    <ClCompile Include="src\intel\intel_hypercall.c" />
+    <ClCompile Include="src\intel\intel_hypercall_worker.c" />
     <ClCompile Include="src\intel\intel_hook.c" />
     <ClCompile Include="src\intel\intel_slat.c" />
     <ClCompile Include="src\intel\intel_vmcs.c" />
@@ -153,26 +154,34 @@
     <ClCompile Include="src\amd\amd_exit.c" />
     <ClCompile Include="src\amd\amd_slat.c" />
     <ClCompile Include="src\amd\amd_vmcb.c" />
+    <ClCompile Include="src\hook_observe.c" />
+    <ClCompile Include="src\hook_thunk.c" />
+    <ClCompile Include="src\hook_trampoline.c" />
     <ClCompile Include="src\introspection.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\device.h" />
     <ClInclude Include="include\hv.h" />
     <ClInclude Include="include\hv_log.h" />
-    <ClInclude Include="include\johnsmith_ioctl.h" />
     <ClInclude Include="src\common\x86_common.h" />
     <ClInclude Include="include\intel.h" />
     <ClInclude Include="src\intel\intel_internal.h" />
     <ClInclude Include="include\amd.h" />
     <ClInclude Include="src\amd\amd_internal.h" />
+    <ClInclude Include="include\hook_observe.h" />
     <ClInclude Include="include\introspection.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="asm\intel.asm">
       <ObjectFileName>$(IntDir)intel_asm.obj</ObjectFileName>
     </MASM>
+    <MASM Include="asm\hook_dispatch.asm">
+      <ObjectFileName>$(IntDir)hook_dispatch.obj</ObjectFileName>
+    </MASM>
     <MASM Include="asm\amd.asm">
       <ObjectFileName>$(IntDir)amd_asm.obj</ObjectFileName>
+    </MASM>
+    <MASM Include="asm\hook_probe.asm">
+      <ObjectFileName>$(IntDir)hook_probe.obj</ObjectFileName>
     </MASM>
   </ItemGroup>
   <ItemGroup>

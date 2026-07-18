@@ -13,6 +13,31 @@ typedef struct _HV_IPI_CONTEXT {
 } HV_IPI_CONTEXT;
 
 static HV_STATE HvGlobalState;
+static EX_RUNDOWN_REF HvPublishRundown;
+
+NTSTATUS IntelHypercallWorkerStart(VOID);
+VOID IntelHypercallWorkerStop(VOID);
+
+BOOLEAN
+HvTryAcquireForWorker(
+    _Out_ HV_STATE** OutState
+    )
+{
+    *OutState = NULL;
+    if (!ExAcquireRundownProtection(&HvPublishRundown)) {
+        return FALSE;
+    }
+    *OutState = &HvGlobalState;
+    return TRUE;
+}
+
+VOID
+HvReleaseForWorker(
+    VOID
+    )
+{
+    ExReleaseRundownProtection(&HvPublishRundown);
+}
 
 static BOOLEAN
 HvIsHypervisorActive(
@@ -317,6 +342,8 @@ HvStart(
         return STATUS_DEVICE_BUSY;
     }
 
+    ExInitializeRundownProtection(&HvPublishRundown);
+
     if (HvIsHypervisorActive()) {
         status = STATUS_HV_FEATURE_UNAVAILABLE;
         goto FailLifecycle;
@@ -389,6 +416,12 @@ HvStart(
         goto FailIntrospection;
     }
 
+    status = IntelHypercallWorkerStart();
+    if (!NT_SUCCESS(status)) {
+        HvStopProcessorsOrFail(&HvGlobalState, HV_FAIL_STOP_ROLLBACK);
+        goto FailIntrospection;
+    }
+
     InterlockedExchange(&HvGlobalState.Lifecycle, HV_LIFECYCLE_RUNNING);
     *State = &HvGlobalState;
     HvLogStartBanner(backend->Name, cpuCount);
@@ -445,6 +478,8 @@ HvStop(
         State->CpuCount);
 
     HvStopProcessorsOrFail(State, HV_FAIL_STOP_SHUTDOWN);
+    IntelHypercallWorkerStop();
+    ExWaitForRundownProtectionRelease(&HvPublishRundown);
 
     {
         NTSTATUS status = HvIntrospectionStop(State);

@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Benchmark|x64">
+      <Configuration>Benchmark</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{9A3244F8-4F17-4C4D-A4C6-7E9D8278A1A2}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>JohnSmithCtl</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Benchmark|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\bin\tools\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\johnsmithctl\$(Configuration)\</IntDir>
+    <TargetName>johnsmithctl</TargetName>
+    <KduConfiguration>Release</KduConfiguration>
+    <KduConfiguration Condition="'$(Configuration)'=='Debug'">Debug</KduConfiguration>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <AdditionalDependencies>bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PreBuildEvent>
+      <Command>if not exist "$(SolutionDir)external\KDU\Source\Hamakaze\output\x64\$(KduConfiguration)\kdu.exe" (
+  MSBuild "$(SolutionDir)external\KDU\Source\KDU.sln" /p:Configuration=$(KduConfiguration) /p:Platform=x64 /p:PlatformToolset=v143 /v:minimal
+  if errorlevel 1 exit /b %25errorlevel%25
+)
+if not exist "$(SolutionDir)external\KDU\Source\Tanikaze\output\x64\$(KduConfiguration)\drv64.dll" (
+  MSBuild "$(SolutionDir)external\KDU\Source\KDU.sln" /p:Configuration=$(KduConfiguration) /p:Platform=x64 /p:PlatformToolset=v143 /v:minimal
+  if errorlevel 1 exit /b %25errorlevel%25
+)</Command>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <Command>copy /Y "$(SolutionDir)external\KDU\Source\Hamakaze\output\x64\$(KduConfiguration)\kdu.exe" "$(OutDir)" &amp; copy /Y "$(SolutionDir)external\KDU\Source\Tanikaze\output\x64\$(KduConfiguration)\drv64.dll" "$(OutDir)" &amp; copy /Y "$(SolutionDir)build\bin\$(Configuration)\JohnSmith.sys" "$(OutDir)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="client\client.cpp" />
+    <ClCompile Include="loader\loader.cpp" />
+    <ClCompile Include="loader\dse.cpp" />
+    <ClCompile Include="commands\hook.cpp" />
+    <ClCompile Include="commands\mem.cpp" />
+    <ClCompile Include="commands\resolve.cpp" />
+    <ClCompile Include="repl.cpp" />
+    <MASM Include="cpuid.asm" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
+  </ImportGroup>
+</Project>

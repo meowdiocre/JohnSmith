@@ -341,6 +341,7 @@ IntelGuestCanTakeNmi(
     }
     return (interruptibility &
             (VMX_GUEST_BLOCKING_BY_NMI |
+             VMX_GUEST_BLOCKING_BY_STI |
              VMX_GUEST_BLOCKING_BY_MOV_SS)) == 0;
 }
 
@@ -371,9 +372,12 @@ IntelRequestNmiInjection(
     )
 {
 
+    if (!Context->VirtualNmiEnabled) {
+        return;
+    }
     if (IntelGuestCanTakeNmi()) {
         if (NT_SUCCESS(IntelVmWrite(
-                VMCS_ENTRY_INTERRUPTION_INFO, 0x80000202u))) {
+                VMCS_ENTRY_INTERRUPTION_INFO, VMX_ENTRY_INJECT_NMI))) {
             return;
         }
     }
@@ -405,15 +409,16 @@ IntelHandleNmiWindow(
     )
 {
 
-    if (InterlockedExchange(&Context->PendingNmi, 0) != 0) {
+    IntelSetPrimaryControl(Context, VMX_PRIMARY_NMI_WINDOW, FALSE);
+    if (Context->VirtualNmiEnabled &&
+        InterlockedExchange(&Context->PendingNmi, 0) != 0) {
         /*
          * VMX Type 2 (NMI) with vector 2, valid.  Deliver-error-code is
          * clear for NMIs.
          */
         (VOID)IntelVmWrite(
-            VMCS_ENTRY_INTERRUPTION_INFO, 0x80000202u);
+            VMCS_ENTRY_INTERRUPTION_INFO, VMX_ENTRY_INJECT_NMI);
     }
-    IntelSetPrimaryControl(Context, VMX_PRIMARY_NMI_WINDOW, FALSE);
 }
 
 VOID
@@ -880,6 +885,108 @@ IntelCaptureStopState(
                VMCS_GUEST_IDTR_LIMIT, &Context->ResumeIdtrLimit);
 }
 
+static VOID
+IntelHypercallReturnClamped(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _Inout_ INTEL_GUEST_REGISTERS* Registers
+    )
+{
+    Registers->Rax = Context->ClampedCpuidEax;
+    Registers->Rbx = Context->ClampedCpuidEbx;
+    Registers->Rcx = Context->ClampedCpuidEcx;
+    Registers->Rdx = Context->ClampedCpuidEdx;
+}
+
+static VOID
+IntelHandleHypercall(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const HV_CPU* Cpu,
+    _Inout_ INTEL_GUEST_REGISTERS* Registers,
+    _In_ ULONG64 GuestRip,
+    _In_ ULONG InstructionLength
+    )
+{
+    ULONG subleaf;
+    BOOLEAN isRegister;
+    PINTEL_HCALL_PAGE page;
+    ULONG cmdIndex;
+
+    subleaf = (ULONG)Registers->Rcx;
+    isRegister = (subleaf == IntelHypercallRegisterSubleaf());
+
+    if (isRegister) {
+        ULONG64 sharedVa = Registers->Rbx;
+        (VOID)IntelHypercallWorkerEnqueueRegister(
+            Context, PsGetCurrentProcess(), (PVOID)sharedVa);
+        IntelHypercallReturnClamped(Context, Registers);
+        IntelAdvanceGuestRip(
+            Context, Cpu, VMX_EXIT_CPUID, GuestRip, InstructionLength);
+        return;
+    }
+
+    if (!ExAcquireRundownProtection(&Context->HypercallPageRundown)) {
+        IntelHypercallReturnClamped(Context, Registers);
+        IntelAdvanceGuestRip(
+            Context, Cpu, VMX_EXIT_CPUID, GuestRip, InstructionLength);
+        return;
+    }
+
+    page = (PINTEL_HCALL_PAGE)Context->HypercallSharedPage;
+    if (!Context->HypercallPageRegistered || page == NULL) {
+        ExReleaseRundownProtection(&Context->HypercallPageRundown);
+        IntelHypercallReturnClamped(Context, Registers);
+        IntelAdvanceGuestRip(
+            Context, Cpu, VMX_EXIT_CPUID, GuestRip, InstructionLength);
+        return;
+    }
+
+    for (cmdIndex = 0; cmdIndex < INTEL_HYPERCALL_CMD_COUNT; ++cmdIndex) {
+        if (page->CommandId ==
+            IntelHypercallCommandId((INTEL_HYPERCALL_CMD)cmdIndex)) {
+            break;
+        }
+    }
+
+    switch (cmdIndex) {
+    case (ULONG)INTEL_HYPERCALL_CMD_REGISTER:
+        page->Result = (ULONG64)STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    case (ULONG)INTEL_HYPERCALL_CMD_INSTALL:
+    case (ULONG)INTEL_HYPERCALL_CMD_REMOVE:
+    case (ULONG)INTEL_HYPERCALL_CMD_READ:
+    case (ULONG)INTEL_HYPERCALL_CMD_WRITE:
+    case (ULONG)INTEL_HYPERCALL_CMD_QUERY_HOOK:
+    case (ULONG)INTEL_HYPERCALL_CMD_LIST_HOOKS:
+    case (ULONG)INTEL_HYPERCALL_CMD_PROBE: {
+        if (page->ResultSequence == (ULONG64)page->Sequence) {
+            break;
+        }
+        {
+            NTSTATUS eq = IntelHypercallWorkerEnqueue(
+                (INTEL_HYPERCALL_CMD)cmdIndex,
+                Context,
+                page,
+                page->Args[0],
+                page->Args[1]);
+            if (eq != STATUS_SUCCESS) {
+                page->Result = (ULONG64)eq;
+                KeMemoryBarrier();
+                page->ResultSequence = (ULONG64)page->Sequence;
+            }
+        }
+        break;
+    }
+    default:
+        page->Result = (ULONG64)STATUS_INVALID_PARAMETER;
+        break;
+    }
+
+    ExReleaseRundownProtection(&Context->HypercallPageRundown);
+    IntelHypercallReturnClamped(Context, Registers);
+    IntelAdvanceGuestRip(
+        Context, Cpu, VMX_EXIT_CPUID, GuestRip, InstructionLength);
+}
+
 ULONG
 IntelVmExitHandler(
     _Inout_ INTEL_GUEST_REGISTERS* Registers,
@@ -956,6 +1063,22 @@ IntelVmExitHandler(
         ULONG leaf = (ULONG)Registers->Rax;
         ULONG subleaf = (ULONG)Registers->Rcx;
 
+        /*
+         * Hypercall trigger: CPUID leaf 1 with the per-boot magic subleaf.
+         * asm/intel.asm forces leaf 1 to this C handler in every build
+         * configuration, so the fast path cannot swallow the trap.  The
+         * explicit seeded guard is required because the leaf is now
+         * hardcoded.  Leaf 1 ignores ECX on the target CPU, so the subleaf
+         * value itself is undetectable; only the VM-exit is.
+         */
+        if (leaf == 1 && IntelHypercallIsSeeded() &&
+            (subleaf == IntelHypercallSubleaf() ||
+             subleaf == IntelHypercallRegisterSubleaf())) {
+            IntelHandleHypercall(
+                context, Cpu, Registers, guestRip, instructionLength);
+            return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
+        }
+
         if (leaf == 0) {
             Registers->Rax = context->CpuidLeaf0Eax;
             Registers->Rbx = context->CpuidLeaf0Ebx;
@@ -1025,6 +1148,48 @@ IntelVmExitHandler(
             (information & (1ull << 31)) == 0) {
             KeBugCheckEx(HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 6, guestRip);
+        }
+        if (context->VirtualNmiEnabled &&
+            (information & (VMX_EVENT_VALID | VMX_EVENT_TYPE_MASK |
+                            VMX_EVENT_VECTOR_MASK)) ==
+                (VMX_EVENT_VALID | VMX_EVENT_TYPE_NMI | 2u)) {
+            ULONG64 interruptibility;
+
+            if (!IntelVmReadValue(
+                    VMCS_GUEST_INTERRUPTIBILITY, &interruptibility)) {
+                KeBugCheckEx(
+                    HYPERVISOR_ERROR,
+                    INTEL_BUGCHECK_UNEXPECTED_EXIT,
+                    reason,
+                    16,
+                    guestRip);
+            }
+            if (InterlockedCompareExchange(
+                    &context->PendingNmi, 0, 0) != 0 ||
+                (pendingInformation & VMX_EVENT_VALID) != 0 ||
+                (interruptibility &
+                 (VMX_GUEST_BLOCKING_BY_STI |
+                  VMX_GUEST_BLOCKING_BY_MOV_SS)) != 0) {
+                InterlockedExchange(&context->PendingNmi, 1);
+                IntelSetPrimaryControl(
+                    context, VMX_PRIMARY_NMI_WINDOW, TRUE);
+                return IntelCompleteVmExit(
+                    context, INTEL_VMEXIT_RESUME);
+            }
+            if (!NT_SUCCESS(IntelVmWrite(
+                        VMCS_GUEST_INTERRUPTIBILITY,
+                        interruptibility & ~VMX_GUEST_BLOCKING_BY_NMI)) ||
+                !NT_SUCCESS(IntelVmWrite(
+                        VMCS_ENTRY_INTERRUPTION_INFO,
+                        VMX_ENTRY_INJECT_NMI))) {
+                KeBugCheckEx(
+                    HYPERVISOR_ERROR,
+                    INTEL_BUGCHECK_UNEXPECTED_EXIT,
+                    reason,
+                    16,
+                    guestRip);
+            }
+            return IntelCompleteVmExit(context, INTEL_VMEXIT_RESUME);
         }
         if ((information & (1ull << 11)) != 0 &&
             !IntelVmReadValue(
@@ -1157,15 +1322,22 @@ IntelVmExitHandler(
                 (INTEL_BACKEND_CONTEXT*)context->BackendContext;
 
             if (IntelHookLookup(backend, guestPhysical, &policy)) {
-                const INTEL_EPT_ROOT* target = NULL;
+                const INTEL_CPU_EPT_VIEW* target = NULL;
 
                 if (backend != NULL && backend->HookRoot != NULL) {
                     BOOLEAN onSecondary = (context->EptPointer ==
-                                           backend->HookRoot->EptPointer);
+                        context->SecondaryEpt.EptPointer);
+                    if (InterlockedCompareExchange(
+                            &backend->ForcePrimaryEpt, 0, 0) != 0) {
+                        /* Removal keeps policy visible until primary leaves
+                           are executable again. Retry without advancing RIP. */
+                        return IntelCompleteVmExit(
+                            context, INTEL_VMEXIT_RESUME);
+                    }
                     if (decoded.Execute && !onSecondary) {
-                        target = backend->HookRoot;
+                        target = &context->SecondaryEpt;
                     } else if (!decoded.Execute && onSecondary) {
-                        target = &backend->PrimaryRoot;
+                        target = &context->PrimaryEpt;
                     }
                 }
                 if (target != NULL) {
@@ -1194,10 +1366,10 @@ IntelVmExitHandler(
             INTEL_BACKEND_CONTEXT* backend =
                 (INTEL_BACKEND_CONTEXT*)context->BackendContext;
             if (backend != NULL && backend->HookRoot != NULL &&
-                context->EptPointer == backend->HookRoot->EptPointer &&
+                context->EptPointer == context->SecondaryEpt.EptPointer &&
                 decoded.Execute) {
                 NTSTATUS switchStatus = IntelSwitchActiveEptRoot(
-                    context, &backend->PrimaryRoot);
+                    context, &context->PrimaryEpt);
                 if (NT_SUCCESS(switchStatus)) {
                     return IntelCompleteVmExit(
                         context, INTEL_VMEXIT_RESUME);

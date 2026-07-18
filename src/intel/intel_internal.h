@@ -155,6 +155,8 @@
 #define VMX_PRIMARY_USE_MSR_BITMAPS         (1u << 28)
 #define VMX_PRIMARY_INTERRUPT_WINDOW        (1u << 2)
 #define VMX_PRIMARY_NMI_WINDOW              (1u << 22)
+#define VMX_PIN_NMI_EXITING                  (1u << 3)
+#define VMX_PIN_VIRTUAL_NMIS                 (1u << 5)
 #define VMX_SECONDARY_ENABLE_EPT            (1u << 1)
 #define VMX_SECONDARY_ENABLE_RDTSCP         (1u << 3)
 #define VMX_SECONDARY_ENABLE_VPID           (1u << 5)
@@ -171,13 +173,13 @@
 #define VMX_ENTRY_LOAD_PAT                  (1u << 14)
 #define VMX_ENTRY_LOAD_EFER                 (1u << 15)
 #define VMX_CR4_VMXE                        (1ull << 13)
-#define X86_CR4_DE                          (1ull << 3)
-#define X86_CR4_PCIDE                       (1ull << 17)
-#define X86_CR3_NOFLUSH                     (1ull << 63)
 #define CPUID_CET_SS                        (1u << 7)
 #define CPUID_CET_IBT                       (1u << 20)
 #define IA32_DEBUGCTL_BTF                    (1ull << 1)
 #define RFLAGS_TF                            (1ull << 8)
+#define X86_CR4_DE                          (1ull << 3)
+#define X86_CR4_PCIDE                       (1ull << 17)
+#define X86_CR3_NOFLUSH                     (1ull << 63)
 #define VMX_GUEST_BLOCKING_BY_STI            (1ull << 0)
 #define VMX_GUEST_BLOCKING_BY_MOV_SS         (1ull << 1)
 #define VMX_GUEST_BLOCKING_BY_NMI            (1ull << 3)
@@ -224,6 +226,11 @@
 #define VMX_ENTRY_INJECT_PF                 0x80000B0Eu
 
 #define VMX_ENTRY_INJECT_DF                 0x80000B08u
+#define VMX_ENTRY_INJECT_NMI                0x80000202u
+#define VMX_EVENT_VALID                     (1u << 31)
+#define VMX_EVENT_TYPE_MASK                 (7u << 8)
+#define VMX_EVENT_TYPE_NMI                  (2u << 8)
+#define VMX_EVENT_VECTOR_MASK               0xffu
 
 /* Intel SDM rev. 092, Vol. 3A §4.7 (page-fault error code). */
 #define X86_PFEC_P                          (1u << 0)
@@ -275,6 +282,7 @@ typedef struct _INTEL_SLAT_SPLIT {
     ULONG PdptIndex;
     ULONG PdIndex;
     ULONG Reason;
+    volatile LONG ReferenceCount;
     PVOID Pt;
 } INTEL_SLAT_SPLIT;
 
@@ -285,6 +293,9 @@ typedef struct _INTEL_EPT_ROOT {
     LIST_ENTRY SplitList;
     EX_PUSH_LOCK SlatLock;
     ULONG64 EptPointer;
+    BOOLEAN OwnPml4;
+    BOOLEAN OwnPdpt;
+    BOOLEAN OwnPds[512];
 } INTEL_EPT_ROOT;
 
 typedef struct _INTEL_EPT_VIOLATION {
@@ -313,6 +324,8 @@ typedef struct _INTEL_BACKEND_CONTEXT {
     ULONG64 MapLimit;
     ULONG64 VmxBasic;
     ULONG64 EptVpidCapabilities;
+    ULONG64 HostCr3;
+    PVOID HostPml4;
 
     volatile LONG64 SlatGeneration;
 } INTEL_BACKEND_CONTEXT;
@@ -354,10 +367,27 @@ IntelFreeEpt(
     );
 
 NTSTATUS
+IntelBuildHostCr3(
+    _Inout_ INTEL_BACKEND_CONTEXT* Backend,
+    _In_ const HV_STATE* State
+    );
+
+VOID
+IntelFreeHostCr3(
+    _Inout_ INTEL_BACKEND_CONTEXT* Backend
+    );
+
+NTSTATUS
 IntelBuildIdentityRoot(
     _Inout_ INTEL_BACKEND_CONTEXT* Backend,
     _Inout_ INTEL_EPT_ROOT* Root,
     _In_ HV_PAGE_ACCESS LeafAccess
+    );
+
+NTSTATUS
+IntelCloneRootTemplate(
+    _In_ const INTEL_EPT_ROOT* Source,
+    _Out_ INTEL_EPT_ROOT* Destination
     );
 
 VOID
@@ -395,6 +425,25 @@ IntelSetOwnedPageMapping(
     _Out_ HV_PAGE_ACCESS* PreviousAccess
     );
 
+FORCEINLINE
+ULONG64
+IntelGetGuestCr2(
+    _In_ const INTEL_CPU_CONTEXT* Context
+    )
+{
+    return Context->GuestCr2;
+}
+
+FORCEINLINE
+VOID
+IntelSetGuestCr2(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ ULONG64 Value
+    )
+{
+    Context->GuestCr2 = Value;
+}
+
 NTSTATUS
 IntelVmWrite(
     _In_ ULONG Field,
@@ -431,26 +480,8 @@ IntelFailEptMisconfiguration(
     _In_ ULONG64 GuestRip
     );
 
-FORCEINLINE
-ULONG64
-IntelGetGuestCr2(
-    _In_ const INTEL_CPU_CONTEXT* Context
-    )
-{
-    return Context->GuestCr2;
-}
-
-FORCEINLINE
-VOID
-IntelSetGuestCr2(
-    _Inout_ INTEL_CPU_CONTEXT* Context,
-    _In_ ULONG64 Value
-    )
-{
-    Context->GuestCr2 = Value;
-}
-
 #define INTEL_HOOK_TABLE_CAPACITY 64u
+#define INTEL_HOOK_HASH_CAPACITY 2048u
 
 typedef enum _INTEL_HOOK_KIND {
     /* Sentinel used to detect an unused slot.  Never returned to callers. */
@@ -461,12 +492,9 @@ typedef enum _INTEL_HOOK_KIND {
 } INTEL_HOOK_KIND;
 
 typedef struct _INTEL_HOOK_POLICY {
-    /* Even values describe stable snapshots; odd values mean mutation. */
-    volatile LONG64 Sequence;
-    /* GPA of the hooked 4 KiB page (aligned).  Zero when the slot is
-       unused.  Publication uses release semantics; readers must observe
-       a nonzero value before reading any other field. */
-    volatile ULONG64 GuestPhysicalAddress;
+    ULONG HookId;
+    ULONG CpuCount;
+    ULONG64 GuestPhysicalAddress;
     /* HPA of the shadow page installed in the secondary root. */
     ULONG64 ShadowHostPhysicalAddress;
     /* Retained virtual address of the shadow page for teardown. */
@@ -476,11 +504,18 @@ typedef struct _INTEL_HOOK_POLICY {
     ULONG64 OriginalPrimaryPte;
     /* Original PTE from the secondary root before install. */
     ULONG64 OriginalSecondaryPte;
+    ULONG64** PrimaryPtes;
+    ULONG64** SecondaryPtes;
     /* One of INTEL_HOOK_KIND. */
     ULONG Kind;
     /* Opaque cookie chosen by the caller. */
-    ULONG Cookie;
+    ULONG64 Cookie;
 } INTEL_HOOK_POLICY;
+
+typedef struct _INTEL_HOOK_HASH_ENTRY {
+    volatile ULONG64 GuestPhysicalAddress;
+    INTEL_HOOK_POLICY* volatile Policy;
+} INTEL_HOOK_HASH_ENTRY;
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -490,7 +525,7 @@ IntelHookInstall(
     _In_reads_bytes_(PatchSize) const VOID* PatchBytes,
     _In_ ULONG PatchOffset,
     _In_ ULONG PatchSize,
-    _In_ ULONG Cookie,
+    _In_ ULONG64 Cookie,
     _Out_ ULONG* HookId
     );
 
@@ -507,7 +542,7 @@ IntelHookQuery(
     _In_ ULONG HookId,
     _Out_ ULONG* Valid,
     _Out_ ULONG* Kind,
-    _Out_ ULONG* Cookie,
+    _Out_ ULONG64* Cookie,
     _Out_ ULONG64* GuestPhysicalAddress,
     _Out_ ULONG64* ShadowHostPhysicalAddress
     );
@@ -532,6 +567,17 @@ IntelHookResetTable(
 VOID
 IntelHookTeardown(
     VOID
+    );
+
+NTSTATUS
+IntelInitializeCpuEptViews(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend
+    );
+
+VOID
+IntelFreeCpuEptViews(
+    _Inout_ INTEL_CPU_CONTEXT* Context
     );
 
 /*
@@ -560,6 +606,7 @@ IntelHookReleasePt(
     _Inout_ INTEL_EPT_ROOT* Root
     );
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IntelHookInvalidateEverywhere(
     _Inout_ HV_STATE* State,
@@ -580,7 +627,32 @@ IntelHookAllowSecondaryViews(
 NTSTATUS
 IntelSwitchActiveEptRoot(
     _Inout_ INTEL_CPU_CONTEXT* Context,
-    _In_ const INTEL_EPT_ROOT* Root
+    _In_ const INTEL_CPU_EPT_VIEW* View
+    );
+
+NTSTATUS
+IntelPrepareCpuHookPage(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_ ULONG64** PrimaryPte,
+    _Outptr_ ULONG64** SecondaryPte
+    );
+
+VOID
+IntelReleaseCpuHookPage(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_result_maybenull_ PVOID* RetiredPrimaryPt,
+    _Outptr_result_maybenull_ PVOID* RetiredSecondaryPt,
+    _Outptr_result_maybenull_ PVOID* RetiredPrimaryPd,
+    _Outptr_result_maybenull_ PVOID* RetiredSecondaryPd
+    );
+
+VOID
+IntelFreeRetiredCpuEptPage(
+    _In_opt_ PVOID Page
     );
 
 VOID
@@ -602,4 +674,107 @@ IntelHandleNmiWindow(
 VOID
 IntelHandleInterruptWindow(
     _Inout_ INTEL_CPU_CONTEXT* Context
+    );
+
+typedef enum _INTEL_HYPERCALL_CMD {
+    INTEL_HYPERCALL_CMD_REGISTER = 0,
+    INTEL_HYPERCALL_CMD_INSTALL  = 1,
+    INTEL_HYPERCALL_CMD_REMOVE   = 2,
+    INTEL_HYPERCALL_CMD_READ     = 3,
+    INTEL_HYPERCALL_CMD_WRITE    = 4,
+    INTEL_HYPERCALL_CMD_QUERY_HOOK = 5,
+    INTEL_HYPERCALL_CMD_LIST_HOOKS = 6,
+    INTEL_HYPERCALL_CMD_PROBE      = 7,
+    INTEL_HYPERCALL_CMD_COUNT      = 8
+} INTEL_HYPERCALL_CMD;
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IntelHypercallPrepare(
+    VOID
+    );
+
+BOOLEAN
+IntelHypercallIsSeeded(
+    VOID
+    );
+
+ULONG
+IntelHypercallSeed(
+    VOID
+    );
+
+ULONG
+IntelHypercallSubleaf(
+    VOID
+    );
+
+ULONG
+IntelHypercallRegisterSubleaf(
+    VOID
+    );
+
+ULONG
+IntelHypercallCommandId(
+    _In_ INTEL_HYPERCALL_CMD Cmd
+    );
+
+/* All offsets are stable across the hypervisor and userspace client. */
+#define INTEL_HCALL_PAYLOAD_OFFSET   256u
+
+#pragma pack(push, 1)
+typedef struct _INTEL_HCALL_PAGE {
+    ULONG CommandId;       /* offset 0  */
+    ULONG Sequence;        /* offset 4  */
+    ULONG64 Args[4];       /* offset 8  */
+    ULONG64 Result;        /* offset 40 */
+    ULONG64 ResultSequence;/* offset 48 */
+    UCHAR Reserved2[INTEL_HCALL_PAYLOAD_OFFSET - 56]; /* pad to 256 */
+    UCHAR Payload[4096 - INTEL_HCALL_PAYLOAD_OFFSET]; /* offset 256 */
+} INTEL_HCALL_PAGE, *PINTEL_HCALL_PAGE;
+#pragma pack(pop)
+
+C_ASSERT(sizeof(INTEL_HCALL_PAGE) == 4096);
+C_ASSERT(FIELD_OFFSET(INTEL_HCALL_PAGE, Payload) == INTEL_HCALL_PAYLOAD_OFFSET);
+C_ASSERT(FIELD_OFFSET(INTEL_HCALL_PAGE, Result) == 40);
+
+_Success_(return == STATUS_SUCCESS)
+NTSTATUS
+IntelHypercallTranslateGuestVa(
+    _In_ ULONG64 GuestCr3,
+    _In_ ULONG64 GuestVa,
+    _Out_ PULONG64 GuestPhysicalAddress,
+    _Out_ PULONG64 PageSize,
+    _In_ BOOLEAN Allow1GbPages
+    );
+
+NTSTATUS
+IntelHypercallWorkerEnqueueRegister(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ PEPROCESS Process,
+    _In_ PVOID SharedPageUserVa
+    );
+
+NTSTATUS
+IntelHypercallWorkerEnqueue(
+    _In_ INTEL_HYPERCALL_CMD Cmd,
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _Inout_ PINTEL_HCALL_PAGE Page,
+    _In_ ULONG64 Arg0,
+    _In_ ULONG64 Arg1
+    );
+
+VOID
+IntelHypercallReleasePage(
+    _Inout_ INTEL_CPU_CONTEXT* Context
+    );
+
+NTSTATUS
+IntelHypercallWorkerStart(
+    VOID
+    );
+
+VOID
+IntelHypercallWorkerStop(
+    VOID
     );

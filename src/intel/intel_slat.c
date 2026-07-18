@@ -8,6 +8,7 @@ IntelFlushEptIfNeeded(
 {
     INTEL_BACKEND_CONTEXT* backend =
         (INTEL_BACKEND_CONTEXT*)Context->BackendContext;
+    INTEL_CPU_EPT_VIEW* activeView;
     LONG64 generation;
     INTEL_INVALIDATION_DESCRIPTOR descriptor;
     ULONG type;
@@ -15,23 +16,38 @@ IntelFlushEptIfNeeded(
     if (backend == NULL) {
         return;
     }
+    /* Force-primary migration changes the active EPTRTA. The primary view is
+       invalidated below only if its own generation is stale; the inactive
+       secondary view keeps its generation until it is activated again. */
     if (InterlockedCompareExchange(&backend->ForcePrimaryEpt, 0, 0) != 0 &&
-        Context->EptPointer != backend->PrimaryRoot.EptPointer) {
+        Context->EptPointer != Context->PrimaryEpt.EptPointer) {
         if (!NT_SUCCESS(IntelVmWrite(
-                VMCS_EPT_POINTER, backend->PrimaryRoot.EptPointer))) {
+                VMCS_EPT_POINTER, Context->PrimaryEpt.EptPointer))) {
             KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_INVALIDATION,
-                Context->EptPointer, backend->PrimaryRoot.EptPointer, 0);
+                Context->EptPointer, Context->PrimaryEpt.EptPointer, 0);
         }
-        Context->EptPointer = backend->PrimaryRoot.EptPointer;
-        Context->SlatGeneration = 0;
+        Context->EptPointer = Context->PrimaryEpt.EptPointer;
     }
+
+    if (Context->EptPointer == Context->PrimaryEpt.EptPointer) {
+        activeView = &Context->PrimaryEpt;
+    } else if (Context->EptPointer == Context->SecondaryEpt.EptPointer) {
+        activeView = &Context->SecondaryEpt;
+    } else {
+        KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_INVALIDATION,
+            Context->EptPointer, Context->PrimaryEpt.EptPointer,
+            Context->SecondaryEpt.EptPointer);
+    }
+
     generation = InterlockedCompareExchange64(
         &backend->SlatGeneration, 0, 0);
-    if (Context->SlatGeneration == generation) {
+    if (InterlockedCompareExchange64(
+            &activeView->SlatGeneration, 0, 0) == generation) {
+        InterlockedExchange64(&Context->SlatGeneration, generation);
         return;
     }
 
-    descriptor.Context = Context->EptPointer;
+    descriptor.Context = activeView->EptPointer;
     descriptor.Reserved = 0;
     type = (backend->EptVpidCapabilities & (1ull << 25)) != 0
         ? INVEPT_SINGLE_CONTEXT : INVEPT_ALL_CONTEXTS;
@@ -41,6 +57,14 @@ IntelFlushEptIfNeeded(
     if (IntelAsmInvept(type, &descriptor) != 0) {
         KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_INVALIDATION,
             type, Context->EptPointer, generation);
+    }
+    if (type == INVEPT_ALL_CONTEXTS) {
+        InterlockedExchange64(
+            &Context->PrimaryEpt.SlatGeneration, generation);
+        InterlockedExchange64(
+            &Context->SecondaryEpt.SlatGeneration, generation);
+    } else {
+        InterlockedExchange64(&activeView->SlatGeneration, generation);
     }
     InterlockedExchange64(&Context->SlatGeneration, generation);
 }
@@ -72,10 +96,25 @@ IntelInvalidateRunningSlat(
     for (index = 0; index < State->CpuCount; ++index) {
         INTEL_CPU_CONTEXT* cpuContext =
             (INTEL_CPU_CONTEXT*)State->Cpus[index].VendorContext;
-        if (cpuContext == NULL || cpuContext->SlatGeneration != generation) {
+        INTEL_CPU_EPT_VIEW* activeView = NULL;
+        LONG64 cpuGeneration = 0;
+
+        if (cpuContext != NULL) {
+            if (cpuContext->EptPointer ==
+                cpuContext->PrimaryEpt.EptPointer) {
+                activeView = &cpuContext->PrimaryEpt;
+            } else if (cpuContext->EptPointer ==
+                       cpuContext->SecondaryEpt.EptPointer) {
+                activeView = &cpuContext->SecondaryEpt;
+            }
+        }
+        if (activeView != NULL) {
+            cpuGeneration = InterlockedCompareExchange64(
+                &activeView->SlatGeneration, 0, 0);
+        }
+        if (activeView == NULL || cpuGeneration != generation) {
             KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_INVALIDATION,
-                index, generation,
-                cpuContext == NULL ? 0 : cpuContext->SlatGeneration);
+                index, generation, cpuGeneration);
         }
     }
 }
@@ -99,10 +138,10 @@ IntelHookRetireSecondaryViews(
         INTEL_CPU_CONTEXT* cpuContext =
             (INTEL_CPU_CONTEXT*)State->Cpus[index].VendorContext;
         if (cpuContext == NULL ||
-            cpuContext->EptPointer != Backend->PrimaryRoot.EptPointer) {
+            cpuContext->EptPointer != cpuContext->PrimaryEpt.EptPointer) {
             KeBugCheckEx(HYPERVISOR_ERROR, INTEL_BUGCHECK_INVALIDATION,
                 index,
-                Backend->PrimaryRoot.EptPointer,
+                cpuContext == NULL ? 0 : cpuContext->PrimaryEpt.EptPointer,
                 cpuContext == NULL ? 0 : cpuContext->EptPointer);
         }
     }
@@ -116,6 +155,7 @@ IntelHookAllowSecondaryViews(
     InterlockedExchange(&Backend->ForcePrimaryEpt, FALSE);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IntelHookInvalidateEverywhere(
     _Inout_ HV_STATE* State,
@@ -292,6 +332,60 @@ IntelSplit2MbLocked(
     return STATUS_SUCCESS;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IntelHookAcquirePt(
+    _Inout_ INTEL_EPT_ROOT* Root,
+    _In_ ULONG64 MapLimit,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _In_ INTEL_SPLIT_REASON NewSplitReason,
+    _Outptr_ ULONG64** Pt,
+    _Out_ ULONG* PtIndex
+    )
+{
+    ULONG pdptIndex;
+    ULONG pdIndex;
+    NTSTATUS status;
+
+    *Pt = NULL;
+    *PtIndex = 0;
+    if (GuestPhysicalAddress >= MapLimit ||
+        GuestPhysicalAddress >= HV_SLAT_MAXIMUM_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    pdptIndex = (ULONG)(GuestPhysicalAddress >> 30);
+    pdIndex = (ULONG)((GuestPhysicalAddress >> 21) & 0x1ff);
+    *PtIndex = (ULONG)((GuestPhysicalAddress >> 12) & 0x1ff);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&Root->SlatLock);
+    status = IntelSplit2MbLocked(Root, pdptIndex, pdIndex, Pt);
+    if (!NT_SUCCESS(status)) {
+        ExReleasePushLockExclusive(&Root->SlatLock);
+        KeLeaveCriticalRegion();
+        return status;
+    }
+
+    if (NewSplitReason == INTEL_SPLIT_REASON_HOOK) {
+        INTEL_SLAT_SPLIT* split = IntelFindSplit(Root, pdptIndex, pdIndex);
+        if (split != NULL) {
+            split->Reason = INTEL_SPLIT_REASON_HOOK;
+        }
+    }
+    /* Lock is intentionally retained; caller releases via IntelHookReleasePt. */
+    return STATUS_SUCCESS;
+}
+
+VOID
+IntelHookReleasePt(
+    _Inout_ INTEL_EPT_ROOT* Root
+    )
+{
+    ExReleasePushLockExclusive(&Root->SlatLock);
+    KeLeaveCriticalRegion();
+}
+
 PVOID
 IntelAllocatePage(
     _In_ ULONG64 HighestAddress
@@ -388,6 +482,8 @@ IntelBuildIdentityRoot(
     if (Root->Pml4 == NULL || Root->Pdpt == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    Root->OwnPml4 = TRUE;
+    Root->OwnPdpt = TRUE;
 
     pml4 = (ULONG64*)Root->Pml4;
     pdpt = (ULONG64*)Root->Pdpt;
@@ -407,6 +503,7 @@ IntelBuildIdentityRoot(
             ExFreePool(ranges);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        Root->OwnPds[pdptIndex] = TRUE;
 
         pd = (ULONG64*)Root->Pds[pdptIndex];
         pdpt[pdptIndex] =
@@ -456,6 +553,49 @@ IntelBuildIdentityRoot(
     return STATUS_SUCCESS;
 }
 
+NTSTATUS
+IntelCloneRootTemplate(
+    _In_ const INTEL_EPT_ROOT* Source,
+    _Out_ INTEL_EPT_ROOT* Destination
+    )
+{
+    ULONG64* pml4;
+    ULONG index;
+
+    if (Source == NULL || Destination == NULL || Source->Pml4 == NULL ||
+        Source->Pdpt == NULL || Source->EptPointer == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(Destination, sizeof(*Destination));
+    InitializeListHead(&Destination->SplitList);
+    Destination->Pml4 = IntelAllocatePage(MAXLONGLONG);
+    Destination->Pdpt = IntelAllocatePage(MAXLONGLONG);
+    if (Destination->Pml4 == NULL || Destination->Pdpt == NULL) {
+        IntelFreeRoot(Destination);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Destination->OwnPml4 = TRUE;
+    Destination->OwnPdpt = TRUE;
+    RtlCopyMemory(Destination->Pml4, Source->Pml4, PAGE_SIZE);
+    RtlCopyMemory(Destination->Pdpt, Source->Pdpt, PAGE_SIZE);
+
+    /* The project maps at most 512 GiB, so only PML4[0] is live.
+       Add per-entry PDPT ownership when HV_SLAT_MAXIMUM_ADDRESS grows. */
+    pml4 = (ULONG64*)Destination->Pml4;
+    pml4[0] = ((ULONG64)MmGetPhysicalAddress(
+                    Destination->Pdpt).QuadPart & EPT_ADDRESS_MASK) |
+              (((const ULONG64*)Source->Pml4)[0] & ~EPT_ADDRESS_MASK);
+    for (index = 0; index < RTL_NUMBER_OF(Destination->Pds); ++index) {
+        Destination->Pds[index] = Source->Pds[index];
+    }
+    Destination->EptPointer =
+        ((ULONG64)MmGetPhysicalAddress(Destination->Pml4).QuadPart &
+         EPT_ADDRESS_MASK) |
+        (Source->EptPointer & ~EPT_ADDRESS_MASK);
+    return STATUS_SUCCESS;
+}
+
 VOID
 IntelFreeRoot(
     _Inout_ INTEL_EPT_ROOT* Root
@@ -468,24 +608,29 @@ IntelFreeRoot(
         INTEL_SLAT_SPLIT* split = CONTAINING_RECORD(
             entry, INTEL_SLAT_SPLIT, Link);
 
-        MmFreeContiguousMemory(split->Pt);
+        if (split->Pt != NULL) {
+            MmFreeContiguousMemory(split->Pt);
+        }
         ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
     }
 
     for (index = 0; index < RTL_NUMBER_OF(Root->Pds); ++index) {
-        if (Root->Pds[index] != NULL) {
+        if (Root->Pds[index] != NULL && Root->OwnPds[index]) {
             MmFreeContiguousMemory(Root->Pds[index]);
-            Root->Pds[index] = NULL;
         }
+        Root->Pds[index] = NULL;
+        Root->OwnPds[index] = FALSE;
     }
-    if (Root->Pdpt != NULL) {
+    if (Root->Pdpt != NULL && Root->OwnPdpt) {
         MmFreeContiguousMemory(Root->Pdpt);
-        Root->Pdpt = NULL;
     }
-    if (Root->Pml4 != NULL) {
+    Root->Pdpt = NULL;
+    Root->OwnPdpt = FALSE;
+    if (Root->Pml4 != NULL && Root->OwnPml4) {
         MmFreeContiguousMemory(Root->Pml4);
-        Root->Pml4 = NULL;
     }
+    Root->Pml4 = NULL;
+    Root->OwnPml4 = FALSE;
     Root->EptPointer = 0;
 }
 
@@ -510,98 +655,365 @@ IntelFreeEpt(
     _Inout_ INTEL_BACKEND_CONTEXT* Context
     )
 {
-    IntelFreeRoot(&Context->PrimaryRoot);
     if (Context->HookRoot != NULL) {
         IntelFreeRoot(Context->HookRoot);
         ExFreePoolWithTag(Context->HookRoot, HV_POOL_TAG_HOOK);
         Context->HookRoot = NULL;
+    }
+    IntelFreeRoot(&Context->PrimaryRoot);
+}
+
+static VOID
+IntelFreeCpuEptView(
+    _Inout_ INTEL_CPU_EPT_VIEW* View
+    )
+{
+    ULONG index;
+
+    while (!IsListEmpty(&View->SplitList)) {
+        PLIST_ENTRY entry = RemoveHeadList(&View->SplitList);
+        INTEL_CPU_EPT_SPLIT* split = CONTAINING_RECORD(
+            entry, INTEL_CPU_EPT_SPLIT, Link);
+        if (split->Pt != NULL) {
+            MmFreeContiguousMemory(split->Pt);
+        }
+        ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
+    }
+    for (index = 0; index < RTL_NUMBER_OF(View->Pds); ++index) {
+        if (View->Pds[index] != NULL) {
+            MmFreeContiguousMemory(View->Pds[index]);
+        }
+    }
+    if (View->Pdpt != NULL) {
+        MmFreeContiguousMemory(View->Pdpt);
+    }
+    if (View->Pml4 != NULL) {
+        MmFreeContiguousMemory(View->Pml4);
+    }
+    RtlZeroMemory(View, sizeof(*View));
+}
+
+static NTSTATUS
+IntelInitializeCpuEptView(
+    _Out_ INTEL_CPU_EPT_VIEW* View,
+    _In_ const INTEL_EPT_ROOT* Template
+    )
+{
+    ULONG64* pml4;
+
+    RtlZeroMemory(View, sizeof(*View));
+    InitializeListHead(&View->SplitList);
+    View->Pml4 = IntelAllocatePage(MAXLONGLONG);
+    View->Pdpt = IntelAllocatePage(MAXLONGLONG);
+    if (View->Pml4 == NULL || View->Pdpt == NULL) {
+        IntelFreeCpuEptView(View);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlCopyMemory(View->Pml4, Template->Pml4, PAGE_SIZE);
+    RtlCopyMemory(View->Pdpt, Template->Pdpt, PAGE_SIZE);
+    pml4 = (ULONG64*)View->Pml4;
+    pml4[0] = ((ULONG64)MmGetPhysicalAddress(View->Pdpt).QuadPart &
+               EPT_ADDRESS_MASK) |
+              (((const ULONG64*)Template->Pml4)[0] & ~EPT_ADDRESS_MASK);
+    /* Intel SDM rev. 092, Vol. 3C Table 27-9: WB=6, four-level
+       walk is encoded as length-minus-one=3, root address in bits 51:12. */
+    View->EptPointer =
+        ((ULONG64)MmGetPhysicalAddress(View->Pml4).QuadPart &
+         EPT_ADDRESS_MASK) |
+        EPT_MEMORY_TYPE_WB | (3ull << 3);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+IntelInitializeCpuEptViews(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend
+    )
+{
+    NTSTATUS status;
+
+    if (Context == NULL || Backend == NULL || Backend->HookRoot == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = IntelInitializeCpuEptView(
+        &Context->PrimaryEpt, &Backend->PrimaryRoot);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    status = IntelInitializeCpuEptView(
+        &Context->SecondaryEpt, Backend->HookRoot);
+    if (!NT_SUCCESS(status)) {
+        IntelFreeCpuEptView(&Context->PrimaryEpt);
+        return status;
+    }
+    Context->PrimaryEpt.SlatGeneration = Backend->SlatGeneration;
+    Context->SecondaryEpt.SlatGeneration = Backend->SlatGeneration;
+    return STATUS_SUCCESS;
+}
+
+VOID
+IntelFreeCpuEptViews(
+    _Inout_ INTEL_CPU_CONTEXT* Context
+    )
+{
+    if (Context == NULL) {
+        return;
+    }
+    IntelFreeCpuEptView(&Context->SecondaryEpt);
+    IntelFreeCpuEptView(&Context->PrimaryEpt);
+}
+
+static INTEL_CPU_EPT_SPLIT*
+IntelFindCpuEptSplit(
+    _In_ INTEL_CPU_EPT_VIEW* View,
+    _In_ ULONG PdptIndex,
+    _In_ ULONG PdIndex
+    )
+{
+    PLIST_ENTRY entry;
+
+    for (entry = View->SplitList.Flink;
+         entry != &View->SplitList;
+         entry = entry->Flink) {
+        INTEL_CPU_EPT_SPLIT* split = CONTAINING_RECORD(
+            entry, INTEL_CPU_EPT_SPLIT, Link);
+        if (split->PdptIndex == PdptIndex && split->PdIndex == PdIndex) {
+            return split;
+        }
+    }
+    return NULL;
+}
+
+static PVOID
+IntelVirtualForEptEntry(
+    _In_ ULONG64 Entry
+    )
+{
+    PHYSICAL_ADDRESS physical;
+
+    physical.QuadPart = (LONGLONG)(Entry & EPT_ADDRESS_MASK);
+    return MmGetVirtualForPhysical(physical);
+}
+
+static NTSTATUS
+IntelPrepareCpuHookView(
+    _Inout_ INTEL_CPU_EPT_VIEW* View,
+    _In_ const INTEL_EPT_ROOT* Template,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_ ULONG64** Pte
+    )
+{
+    ULONG pdptIndex = (ULONG)(GuestPhysicalAddress >> 30);
+    ULONG pdIndex = (ULONG)((GuestPhysicalAddress >> 21) & 0x1ff);
+    ULONG ptIndex = (ULONG)((GuestPhysicalAddress >> 12) & 0x1ff);
+    INTEL_CPU_EPT_SPLIT* split;
+    ULONG64* pd;
+
+    *Pte = NULL;
+    if (View->Pds[pdptIndex] == NULL) {
+        PVOID privatePd = IntelAllocatePage(MAXLONGLONG);
+        ULONG64 templateEntry;
+
+        if (privatePd == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlCopyMemory(privatePd, Template->Pds[pdptIndex], PAGE_SIZE);
+        templateEntry = ((const ULONG64*)Template->Pdpt)[pdptIndex];
+        View->Pds[pdptIndex] = privatePd;
+        KeMemoryBarrier();
+        InterlockedExchange64(
+            (volatile LONG64*)&((ULONG64*)View->Pdpt)[pdptIndex],
+            (LONG64)(((ULONG64)MmGetPhysicalAddress(privatePd).QuadPart &
+                      EPT_ADDRESS_MASK) |
+                     (templateEntry & ~EPT_ADDRESS_MASK)));
+    }
+
+    pd = (ULONG64*)View->Pds[pdptIndex];
+    split = IntelFindCpuEptSplit(View, pdptIndex, pdIndex);
+    if (split == NULL) {
+        ULONG64 sourcePde = pd[pdIndex];
+        ULONG64* pt;
+        ULONG index;
+
+        split = (INTEL_CPU_EPT_SPLIT*)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(*split), HV_POOL_TAG_SLAT_SPLIT);
+        if (split == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(split, sizeof(*split));
+        split->Pt = IntelAllocatePage(MAXLONGLONG);
+        if (split->Pt == NULL) {
+            ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        pt = (ULONG64*)split->Pt;
+        if ((sourcePde & EPT_LARGE_PAGE) != 0) {
+            ULONG64 attributes = sourcePde &
+                (EPT_ACCESS_MASK | EPT_MEMORY_TYPE_MASK);
+            for (index = 0; index < 512; ++index) {
+                pt[index] = (sourcePde & EPT_2MB_ADDRESS_MASK) |
+                            ((ULONG64)index << PAGE_SHIFT) | attributes;
+            }
+        } else {
+            PVOID sourcePt = IntelVirtualForEptEntry(sourcePde);
+            if (sourcePt == NULL) {
+                MmFreeContiguousMemory(split->Pt);
+                ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
+                return STATUS_DATA_ERROR;
+            }
+            RtlCopyMemory(pt, sourcePt, PAGE_SIZE);
+        }
+        split->PdptIndex = pdptIndex;
+        split->PdIndex = pdIndex;
+        InsertTailList(&View->SplitList, &split->Link);
+        KeMemoryBarrier();
+        InterlockedExchange64(
+            (volatile LONG64*)&pd[pdIndex],
+            (LONG64)(((ULONG64)MmGetPhysicalAddress(pt).QuadPart &
+                      EPT_ADDRESS_MASK) | EPT_ACCESS_MASK));
+    }
+
+    InterlockedIncrement(&split->ReferenceCount);
+    ++View->PdHookCount[pdptIndex];
+    *Pte = &((ULONG64*)split->Pt)[ptIndex];
+    return STATUS_SUCCESS;
+}
+
+static VOID
+IntelReleaseCpuHookView(
+    _Inout_ INTEL_CPU_EPT_VIEW* View,
+    _In_ const INTEL_EPT_ROOT* Template,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_result_maybenull_ PVOID* RetiredPt,
+    _Outptr_result_maybenull_ PVOID* RetiredPd
+    )
+{
+    ULONG pdptIndex = (ULONG)(GuestPhysicalAddress >> 30);
+    ULONG pdIndex = (ULONG)((GuestPhysicalAddress >> 21) & 0x1ff);
+    INTEL_CPU_EPT_SPLIT* split = IntelFindCpuEptSplit(
+        View, pdptIndex, pdIndex);
+
+    *RetiredPt = NULL;
+    *RetiredPd = NULL;
+    if (split == NULL || split->ReferenceCount <= 0) {
+        return;
+    }
+    if (InterlockedDecrement(&split->ReferenceCount) == 0) {
+        ULONG64 templatePde =
+            ((const ULONG64*)Template->Pds[pdptIndex])[pdIndex];
+        InterlockedExchange64(
+            (volatile LONG64*)&((ULONG64*)View->Pds[pdptIndex])[pdIndex],
+            (LONG64)templatePde);
+        RemoveEntryList(&split->Link);
+        *RetiredPt = split->Pt;
+        split->Pt = NULL;
+        ExFreePoolWithTag(split, HV_POOL_TAG_SLAT_SPLIT);
+    }
+    NT_ASSERT(View->PdHookCount[pdptIndex] != 0);
+    if (--View->PdHookCount[pdptIndex] == 0) {
+        ULONG64 templatePdpte =
+            ((const ULONG64*)Template->Pdpt)[pdptIndex];
+        PVOID pd = View->Pds[pdptIndex];
+        InterlockedExchange64(
+            (volatile LONG64*)&((ULONG64*)View->Pdpt)[pdptIndex],
+            (LONG64)templatePdpte);
+        View->Pds[pdptIndex] = NULL;
+        *RetiredPd = pd;
+    }
+}
+
+NTSTATUS
+IntelPrepareCpuHookPage(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_ ULONG64** PrimaryPte,
+    _Outptr_ ULONG64** SecondaryPte
+    )
+{
+    NTSTATUS status;
+
+    *PrimaryPte = NULL;
+    *SecondaryPte = NULL;
+    status = IntelPrepareCpuHookView(
+        &Context->PrimaryEpt, &Backend->PrimaryRoot,
+        GuestPhysicalAddress, PrimaryPte);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    status = IntelPrepareCpuHookView(
+        &Context->SecondaryEpt, Backend->HookRoot,
+        GuestPhysicalAddress, SecondaryPte);
+    if (!NT_SUCCESS(status)) {
+        PVOID retiredPt;
+        PVOID retiredPd;
+        IntelReleaseCpuHookView(
+            &Context->PrimaryEpt, &Backend->PrimaryRoot,
+            GuestPhysicalAddress, &retiredPt, &retiredPd);
+        IntelFreeRetiredCpuEptPage(retiredPt);
+        IntelFreeRetiredCpuEptPage(retiredPd);
+    }
+    return status;
+}
+
+VOID
+IntelReleaseCpuHookPage(
+    _Inout_ INTEL_CPU_CONTEXT* Context,
+    _In_ const INTEL_BACKEND_CONTEXT* Backend,
+    _In_ ULONG64 GuestPhysicalAddress,
+    _Outptr_result_maybenull_ PVOID* RetiredPrimaryPt,
+    _Outptr_result_maybenull_ PVOID* RetiredSecondaryPt,
+    _Outptr_result_maybenull_ PVOID* RetiredPrimaryPd,
+    _Outptr_result_maybenull_ PVOID* RetiredSecondaryPd
+    )
+{
+    IntelReleaseCpuHookView(
+        &Context->PrimaryEpt, &Backend->PrimaryRoot,
+        GuestPhysicalAddress, RetiredPrimaryPt, RetiredPrimaryPd);
+    IntelReleaseCpuHookView(
+        &Context->SecondaryEpt, Backend->HookRoot,
+        GuestPhysicalAddress, RetiredSecondaryPt, RetiredSecondaryPd);
+}
+
+VOID
+IntelFreeRetiredCpuEptPage(
+    _In_opt_ PVOID Page
+    )
+{
+    if (Page != NULL) {
+        MmFreeContiguousMemory(Page);
     }
 }
 
 NTSTATUS
 IntelSwitchActiveEptRoot(
     _Inout_ INTEL_CPU_CONTEXT* Context,
-    _In_ const INTEL_EPT_ROOT* Root
+    _In_ const INTEL_CPU_EPT_VIEW* View
     )
 {
     INTEL_BACKEND_CONTEXT* backend;
     NTSTATUS status;
 
-    if (Context == NULL || Root == NULL || Root->EptPointer == 0) {
+    if (Context == NULL || View == NULL || View->EptPointer == 0) {
         return STATUS_INVALID_PARAMETER;
     }
     backend = (INTEL_BACKEND_CONTEXT*)Context->BackendContext;
     if (backend != NULL &&
         InterlockedCompareExchange(&backend->ForcePrimaryEpt, 0, 0) != 0 &&
-        Root->EptPointer != backend->PrimaryRoot.EptPointer) {
+        View->EptPointer != Context->PrimaryEpt.EptPointer) {
         return STATUS_DEVICE_BUSY;
     }
-    if (Root->EptPointer == Context->EptPointer) {
+    if (View->EptPointer == Context->EptPointer) {
         return STATUS_SUCCESS;
     }
 
-    status = IntelVmWrite(VMCS_EPT_POINTER, Root->EptPointer);
+    status = IntelVmWrite(VMCS_EPT_POINTER, View->EptPointer);
     if (!NT_SUCCESS(status)) {
         return status;
     }
-    Context->EptPointer = Root->EptPointer;
-    Context->SlatGeneration = 0;
+    Context->EptPointer = View->EptPointer;
     IntelFlushEptIfNeeded(Context);
     return STATUS_SUCCESS;
-}
-
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-IntelHookAcquirePt(
-    _Inout_ INTEL_EPT_ROOT* Root,
-    _In_ ULONG64 MapLimit,
-    _In_ ULONG64 GuestPhysicalAddress,
-    _In_ INTEL_SPLIT_REASON NewSplitReason,
-    _Outptr_ ULONG64** Pt,
-    _Out_ ULONG* PtIndex
-    )
-{
-    ULONG pdptIndex;
-    ULONG pdIndex;
-    NTSTATUS status;
-
-    *Pt = NULL;
-    *PtIndex = 0;
-    if (GuestPhysicalAddress >= MapLimit ||
-        GuestPhysicalAddress >= HV_SLAT_MAXIMUM_ADDRESS) {
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    pdptIndex = (ULONG)(GuestPhysicalAddress >> 30);
-    pdIndex = (ULONG)((GuestPhysicalAddress >> 21) & 0x1ff);
-    *PtIndex = (ULONG)((GuestPhysicalAddress >> 12) & 0x1ff);
-
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&Root->SlatLock);
-    status = IntelSplit2MbLocked(Root, pdptIndex, pdIndex, Pt);
-    if (!NT_SUCCESS(status)) {
-        ExReleasePushLockExclusive(&Root->SlatLock);
-        KeLeaveCriticalRegion();
-        return status;
-    }
-
-    if (NewSplitReason == INTEL_SPLIT_REASON_HOOK) {
-        INTEL_SLAT_SPLIT* split = IntelFindSplit(Root, pdptIndex, pdIndex);
-        if (split != NULL) {
-            split->Reason = INTEL_SPLIT_REASON_HOOK;
-        }
-    }
-    /* Lock is intentionally retained; caller releases via IntelHookReleasePt. */
-    return STATUS_SUCCESS;
-}
-
-VOID
-IntelHookReleasePt(
-    _Inout_ INTEL_EPT_ROOT* Root
-    )
-{
-    ExReleasePushLockExclusive(&Root->SlatLock);
-    KeLeaveCriticalRegion();
 }
 
 static NTSTATUS
@@ -701,87 +1113,6 @@ Exit:
 }
 
 NTSTATUS
-IntelSetOwnedPageMapping(
-    _Inout_ HV_STATE* State,
-    _In_ PHYSICAL_ADDRESS GuestPhysicalAddress,
-    _In_ PHYSICAL_ADDRESS HostPhysicalAddress,
-    _In_ HV_PAGE_ACCESS Access,
-    _Out_ PHYSICAL_ADDRESS* PreviousHostPhysicalAddress,
-    _Out_ HV_PAGE_ACCESS* PreviousAccess
-    )
-{
-    INTEL_BACKEND_CONTEXT* context;
-    INTEL_EPT_ROOT* root;
-    ULONG pdptIndex;
-    ULONG pdIndex;
-    ULONG ptIndex;
-    ULONG64* pt;
-    ULONG64 pte;
-    NTSTATUS status;
-    BOOLEAN invalidate = FALSE;
-    INTEL_SLAT_SPLIT* retiredSplit = NULL;
-
-    if (State == NULL || State->BackendContext == NULL ||
-        PreviousHostPhysicalAddress == NULL || PreviousAccess == NULL ||
-        HostPhysicalAddress.QuadPart < 0 ||
-        (((ULONG64)HostPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0) ||
-        (((ULONG)Access) & ~EPT_ACCESS_MASK) != 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (!IntelSlatMayChange(State) || KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
-    if ((((ULONG)Access) & HV_PAGE_ACCESS_WRITE) != 0 &&
-        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0) {
-        return STATUS_NOT_SUPPORTED;
-    }
-    if ((((ULONG)Access) & HV_PAGE_ACCESS_EXECUTE) != 0 &&
-        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0 &&
-        (context->EptVpidCapabilities & 1) == 0) {
-        return STATUS_NOT_SUPPORTED;
-    }
-    status = IntelValidateOwnedAddress(
-        context, GuestPhysicalAddress, &pdptIndex, &pdIndex, &ptIndex);
-    if (!NT_SUCCESS(status)) return status;
-    if ((ULONG64)HostPhysicalAddress.QuadPart >= HV_SLAT_MAXIMUM_ADDRESS) {
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    root = &context->PrimaryRoot;
-    KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(&root->SlatLock);
-    status = IntelSplit2MbLocked(root, pdptIndex, pdIndex, &pt);
-    if (NT_SUCCESS(status)) {
-        pte = pt[ptIndex];
-        PreviousHostPhysicalAddress->QuadPart =
-            (LONGLONG)(pte & EPT_ADDRESS_MASK);
-        *PreviousAccess = (HV_PAGE_ACCESS)(pte & EPT_ACCESS_MASK);
-        InterlockedExchange64(
-            (volatile LONG64*)&pt[ptIndex],
-            (LONG64)((pte & ~(EPT_ADDRESS_MASK | EPT_ACCESS_MASK)) |
-                     ((ULONG64)HostPhysicalAddress.QuadPart & EPT_ADDRESS_MASK) |
-                     (ULONG64)Access));
-        KeMemoryBarrier();
-        retiredSplit = IntelTryMerge2MbLocked(
-            root, pdptIndex, pdIndex);
-        invalidate = InterlockedCompareExchange(
-            &State->Lifecycle, 0, 0) == HV_LIFECYCLE_RUNNING;
-    }
-    ExReleasePushLockExclusive(&root->SlatLock);
-    KeLeaveCriticalRegion();
-
-    if (NT_SUCCESS(status) && invalidate) {
-        IntelInvalidateRunningSlat(State, context);
-    }
-    if (NT_SUCCESS(status)) {
-        IntelFreeRetiredSplit(retiredSplit);
-    }
-    return status;
-}
-
-NTSTATUS
 IntelSetOwnedPageAccess(
     _Inout_ HV_STATE* State,
     _In_ PHYSICAL_ADDRESS PhysicalAddress,
@@ -853,6 +1184,189 @@ Exit:
         IntelInvalidateRunningSlat(State, context);
     }
     /* The old PT cannot be reclaimed until every CPU discarded its walk. */
+    if (NT_SUCCESS(status)) {
+        IntelFreeRetiredSplit(retiredSplit);
+    }
+    return status;
+}
+
+NTSTATUS
+IntelSetOwnedPageMapping(
+    _Inout_ HV_STATE* State,
+    _In_ PHYSICAL_ADDRESS GuestPhysicalAddress,
+    _In_ PHYSICAL_ADDRESS HostPhysicalAddress,
+    _In_ HV_PAGE_ACCESS Access,
+    _Out_ PHYSICAL_ADDRESS* PreviousHostPhysicalAddress,
+    _Out_ HV_PAGE_ACCESS* PreviousAccess
+    )
+{
+    INTEL_BACKEND_CONTEXT* context;
+    INTEL_EPT_ROOT* root;
+    ULONG pdptIndex;
+    ULONG pdIndex;
+    ULONG ptIndex;
+    ULONG64* pt;
+    ULONG64 pte;
+    NTSTATUS status;
+    BOOLEAN invalidate = FALSE;
+    INTEL_SLAT_SPLIT* retiredSplit = NULL;
+    ULONG index;
+
+    if (State == NULL || State->BackendContext == NULL ||
+        PreviousHostPhysicalAddress == NULL || PreviousAccess == NULL ||
+        HostPhysicalAddress.QuadPart < 0 ||
+        (((ULONG64)HostPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0) ||
+        (((ULONG)Access) & ~EPT_ACCESS_MASK) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!IntelSlatMayChange(State) || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    context = (INTEL_BACKEND_CONTEXT*)State->BackendContext;
+    if ((((ULONG)Access) & HV_PAGE_ACCESS_WRITE) != 0 &&
+        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if ((((ULONG)Access) & HV_PAGE_ACCESS_EXECUTE) != 0 &&
+        (((ULONG)Access) & HV_PAGE_ACCESS_READ) == 0 &&
+        (context->EptVpidCapabilities & 1) == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    status = IntelValidateOwnedAddress(
+        context, GuestPhysicalAddress, &pdptIndex, &pdIndex, &ptIndex);
+    if (!NT_SUCCESS(status)) return status;
+    if ((ULONG64)HostPhysicalAddress.QuadPart >= HV_SLAT_MAXIMUM_ADDRESS) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    root = &context->PrimaryRoot;
+    if (context->HookRoot == NULL ||
+        context->HookRoot->Pds[pdptIndex] != root->Pds[pdptIndex]) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    for (index = 0; index < State->CpuCount; ++index) {
+        if (State->Cpus[index].VendorContext == NULL) {
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+    }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&context->HookLock);
+    ExAcquirePushLockExclusive(&root->SlatLock);
+    status = IntelSplit2MbLocked(root, pdptIndex, pdIndex, &pt);
+    if (NT_SUCCESS(status)) {
+        pte = pt[ptIndex];
+        PreviousHostPhysicalAddress->QuadPart =
+            (LONGLONG)(pte & EPT_ADDRESS_MASK);
+        *PreviousAccess = (HV_PAGE_ACCESS)(pte & EPT_ACCESS_MASK);
+        InterlockedExchange64(
+            (volatile LONG64*)&pt[ptIndex],
+            (LONG64)((pte & ~(EPT_ADDRESS_MASK | EPT_ACCESS_MASK)) |
+                      ((ULONG64)HostPhysicalAddress.QuadPart & EPT_ADDRESS_MASK) |
+                      (ULONG64)Access));
+        KeMemoryBarrier();
+
+        /* PrimaryRoot and HookRoot share template PD pages. Processor-local
+           private PDs do not, so copy the changed leaf into both live views. */
+        for (index = 0; index < State->CpuCount; ++index) {
+            INTEL_CPU_CONTEXT* cpuContext =
+                (INTEL_CPU_CONTEXT*)State->Cpus[index].VendorContext;
+            INTEL_CPU_EPT_VIEW* views[2] = {
+                &cpuContext->PrimaryEpt, &cpuContext->SecondaryEpt
+            };
+            ULONG viewIndex;
+
+            for (viewIndex = 0; viewIndex < RTL_NUMBER_OF(views); ++viewIndex) {
+                INTEL_CPU_EPT_VIEW* view = views[viewIndex];
+                INTEL_CPU_EPT_SPLIT* split;
+                ULONG64 templatePde;
+
+                if (view->Pds[pdptIndex] == NULL) {
+                    continue;
+                }
+                templatePde = ((ULONG64*)root->Pds[pdptIndex])[pdIndex];
+                split = IntelFindCpuEptSplit(view, pdptIndex, pdIndex);
+                if (split == NULL) {
+                    InterlockedExchange64(
+                        (volatile LONG64*)&
+                            ((ULONG64*)view->Pds[pdptIndex])[pdIndex],
+                        (LONG64)templatePde);
+                } else {
+                    ULONG64* templatePt =
+                        (ULONG64*)IntelVirtualForEptEntry(templatePde);
+                    if (templatePt == NULL) {
+                        KeBugCheckEx(
+                            HYPERVISOR_ERROR,
+                            INTEL_BUGCHECK_INVALIDATION,
+                            GuestPhysicalAddress.QuadPart,
+                            templatePde,
+                            index);
+                    }
+                    InterlockedExchange64(
+                        (volatile LONG64*)&
+                            ((ULONG64*)split->Pt)[ptIndex],
+                        (LONG64)templatePt[ptIndex]);
+                }
+            }
+        }
+
+        retiredSplit = IntelTryMerge2MbLocked(
+            root, pdptIndex, pdIndex);
+
+        /* A merge replaces the shared PT with a 2 MiB leaf. Refresh private
+           PDs before the retired template PT is freed. */
+        if (retiredSplit != NULL) {
+            ULONG64 templatePde =
+                ((ULONG64*)root->Pds[pdptIndex])[pdIndex];
+            ULONG64 templatePte =
+                (templatePde & EPT_2MB_ADDRESS_MASK) |
+                ((ULONG64)ptIndex << PAGE_SHIFT) |
+                (templatePde & (EPT_ACCESS_MASK | EPT_MEMORY_TYPE_MASK));
+
+            for (index = 0; index < State->CpuCount; ++index) {
+                INTEL_CPU_CONTEXT* cpuContext =
+                    (INTEL_CPU_CONTEXT*)State->Cpus[index].VendorContext;
+                INTEL_CPU_EPT_VIEW* views[2] = {
+                    &cpuContext->PrimaryEpt, &cpuContext->SecondaryEpt
+                };
+                ULONG viewIndex;
+
+                for (viewIndex = 0;
+                     viewIndex < RTL_NUMBER_OF(views);
+                     ++viewIndex) {
+                    INTEL_CPU_EPT_VIEW* view = views[viewIndex];
+                    INTEL_CPU_EPT_SPLIT* split;
+
+                    if (view->Pds[pdptIndex] == NULL) {
+                        continue;
+                    }
+                    split = IntelFindCpuEptSplit(
+                        view, pdptIndex, pdIndex);
+                    if (split == NULL) {
+                        InterlockedExchange64(
+                            (volatile LONG64*)&
+                                ((ULONG64*)view->Pds[pdptIndex])[pdIndex],
+                            (LONG64)templatePde);
+                    } else {
+                        InterlockedExchange64(
+                            (volatile LONG64*)&
+                                ((ULONG64*)split->Pt)[ptIndex],
+                            (LONG64)templatePte);
+                    }
+                }
+            }
+        }
+        invalidate = InterlockedCompareExchange(
+            &State->Lifecycle, 0, 0) == HV_LIFECYCLE_RUNNING;
+    }
+    ExReleasePushLockExclusive(&root->SlatLock);
+    ExReleasePushLockExclusive(&context->HookLock);
+    KeLeaveCriticalRegion();
+
+    if (NT_SUCCESS(status) && invalidate) {
+        IntelInvalidateRunningSlat(State, context);
+    }
     if (NT_SUCCESS(status)) {
         IntelFreeRetiredSplit(retiredSplit);
     }

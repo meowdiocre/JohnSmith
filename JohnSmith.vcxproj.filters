@@ -32,24 +32,27 @@
   <ItemGroup>
     <ClInclude Include="include\hv.h"><Filter>Header Files\Public</Filter></ClInclude>
     <ClInclude Include="include\hv_log.h"><Filter>Header Files\Public</Filter></ClInclude>
-    <ClInclude Include="include\device.h"><Filter>Header Files\Public</Filter></ClInclude>
-    <ClInclude Include="include\johnsmith_ioctl.h"><Filter>Header Files\Public</Filter></ClInclude>
     <ClInclude Include="include\intel.h"><Filter>Header Files\Public</Filter></ClInclude>
     <ClInclude Include="include\amd.h"><Filter>Header Files\Public</Filter></ClInclude>
     <ClInclude Include="include\introspection.h"><Filter>Header Files\Public</Filter></ClInclude>
+    <ClInclude Include="include\hook_observe.h"><Filter>Header Files\Public</Filter></ClInclude>
     <ClInclude Include="src\common\x86_common.h"><Filter>Header Files\Private</Filter></ClInclude>
     <ClInclude Include="src\intel\intel_internal.h"><Filter>Header Files\Private</Filter></ClInclude>
     <ClInclude Include="src\amd\amd_internal.h"><Filter>Header Files\Private</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\driver.c"><Filter>Source Files\Core</Filter></ClCompile>
-    <ClCompile Include="src\device.c"><Filter>Source Files\Core</Filter></ClCompile>
     <ClCompile Include="src\hv.c"><Filter>Source Files\Core</Filter></ClCompile>
     <ClCompile Include="src\log.c"><Filter>Source Files\Core</Filter></ClCompile>
     <ClCompile Include="src\introspection.c"><Filter>Source Files\Core</Filter></ClCompile>
+    <ClCompile Include="src\hook_observe.c"><Filter>Source Files\Core</Filter></ClCompile>
+    <ClCompile Include="src\hook_thunk.c"><Filter>Source Files\Core</Filter></ClCompile>
+    <ClCompile Include="src\hook_trampoline.c"><Filter>Source Files\Core</Filter></ClCompile>
     <ClCompile Include="src\common\x86_common.c"><Filter>Source Files\Common</Filter></ClCompile>
     <ClCompile Include="src\intel.c"><Filter>Source Files\Intel</Filter></ClCompile>
     <ClCompile Include="src\intel\intel_exit.c"><Filter>Source Files\Intel</Filter></ClCompile>
+    <ClCompile Include="src\intel\intel_hypercall.c"><Filter>Source Files\Intel</Filter></ClCompile>
+    <ClCompile Include="src\intel\intel_hypercall_worker.c"><Filter>Source Files\Intel</Filter></ClCompile>
     <ClCompile Include="src\intel\intel_hook.c"><Filter>Source Files\Intel</Filter></ClCompile>
     <ClCompile Include="src\intel\intel_slat.c"><Filter>Source Files\Intel</Filter></ClCompile>
     <ClCompile Include="src\intel\intel_vmcs.c"><Filter>Source Files\Intel</Filter></ClCompile>
@@ -61,5 +64,7 @@
   <ItemGroup>
     <MASM Include="asm\intel.asm"><Filter>Assembly Files</Filter></MASM>
     <MASM Include="asm\amd.asm"><Filter>Assembly Files</Filter></MASM>
+    <MASM Include="asm\hook_dispatch.asm"><Filter>Assembly Files</Filter></MASM>
+    <MASM Include="asm\hook_probe.asm"><Filter>Assembly Files</Filter></MASM>
   </ItemGroup>
 </Project>
