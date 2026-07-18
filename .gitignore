@@ -34,6 +34,9 @@ obj*/
 # Local agent metadata and bundled reference manuals
 .agents/
 .codex/
+.codegraph/
+drv64.dll
+static/docs/hyprdbg.2207.05676v2.pdf
 
 # OS/editor noise
 .DS_Store
