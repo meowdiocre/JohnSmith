@@ -16,22 +16,33 @@
 | Release | Disabled | Enabled | Disabled |
 | Benchmark | Disabled | Enabled | Enabled |
 
+Build from a Visual Studio developer shell:
+
+```powershell
+msbuild .\JohnSmith.sln /m /p:Configuration=Release /p:Platform=x64
+.\build\bin\tools\johnsmithctl.exe selftest
+```
+
 
 ## Load workflow
 
-JohnSmith is unsigned. The KDU helper is intended only for disposable test
-systems with Secure Boot, Hyper-V, VBS, and HVCI disabled.
+JohnSmith is unsigned. `johnsmithctl` builds KDU when needed, temporarily
+changes Driver Signature Enforcement, creates the service, starts the driver,
+and restores DSE.
 
 ```powershell
-.\tools\load-kdu.ps1 -Config Release
-.\tools\unload-kdu.ps1
+.\build\bin\tools\johnsmithctl.exe start --cpu 0
 ```
 
-The loader removes any existing service before invoking KDU, temporarily
-changes DSE, creates a normal demand-start kernel service, restores DSE, and
-then requests hypervisor startup through the service registry state.
+Record the printed seed. A later client must use the same seed while that
+driver instance is running. Stop and remove the service with:
 
-Do not terminate the loader between DSE disable and its `finally` restoration.
+```powershell
+.\build\bin\tools\johnsmithctl.exe stop
+```
+
+Use only a disposable test system with Secure Boot, Hyper-V, VBS, and HVCI
+disabled. Do not terminate the loader while DSE is disabled.
 
 ## Verify the running artifact
 
@@ -55,7 +66,8 @@ invalidates code-to-log conclusions.
 For the transition floor:
 
 ```powershell
-.\tools\load-kdu.ps1 -Config Benchmark
+msbuild .\JohnSmith.sln /m /p:Configuration=Benchmark /p:Platform=x64
+.\build\bin\tools\johnsmithctl.exe start --cpu 0
 .\build\bin\tools\vmexit-bench.exe 200000 --vmcall
 ```
 
@@ -72,7 +84,7 @@ the handler.
 | Rollback after injected failure | Required | Required | No |
 | Live SLAT permission change | INVEPT generation | VMMCALL/TLB_CONTROL generation | No |
 | CPUID policy | Masked/emulated | Masked/emulated | No |
-| Hook IOCTLs | Disabled pending safety fixes | Unsupported | No |
+| Execute hooks | Dual-EPT install/remove/query | Unsupported | No |
 | Teardown/state restoration | Required | Required | No |
 | Debug/Release/Benchmark compile | Required | Required | Yes |
 | WDK analysis | Required | Required | Yes |
