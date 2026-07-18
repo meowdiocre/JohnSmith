@@ -25,24 +25,6 @@ backends for isolated red-team experiments.
 Intel and AMD CPUID exits are emulated and vendor-virtualization features are
 hidden. Execute hooks and `johnsmithctl` control are Intel-only.
 
-## Build and start
-
-```powershell
-msbuild .\JohnSmith.sln /m /p:Configuration=Release /p:Platform=x64
-.\build\bin\tools\johnsmithctl.exe selftest
-.\build\bin\tools\johnsmithctl.exe start --cpu 0
-```
-
-`johnsmithctl start` temporarily modifies Driver Signature Enforcement through
-KDU. Use it only on a disposable test system with Secure Boot, Hyper-V, VBS,
-and HVCI disabled. Do not interrupt the loader before it restores DSE.
-
-Stop and remove the service with:
-
-```powershell
-.\build\bin\tools\johnsmithctl.exe stop
-```
-
 ## Documentation
 
 | Document | Purpose |
