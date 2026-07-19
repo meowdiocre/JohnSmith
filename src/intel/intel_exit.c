@@ -554,6 +554,14 @@ IntelCompleteVmExit(
     _In_ INTEL_VMEXIT_ACTION Action
     )
 {
+    if (Action == INTEL_VMEXIT_RESUME) {
+        if (InterlockedCompareExchange64(
+                &Context->RendezvousOwnedEpoch, 0, 0) != 0) {
+            IntelRendezvousFinish(Context);
+        } else {
+            (VOID)IntelRendezvousJoinActive(Context);
+        }
+    }
 #if JOHNSMITH_DIAGNOSTICS
     LONG64 sequence = InterlockedCompareExchange64(
         &Context->ExitSequence, 0, 0);
@@ -1000,6 +1008,7 @@ IntelVmExitHandler(
     ULONG instructionLength;
     ULONG pendingInformation;
     ULONG64 guestRip;
+    INTEL_RENDEZVOUS_POLICY rendezvousPolicy;
     NTSTATUS status;
     int cpuid[4];
 
@@ -1042,6 +1051,13 @@ IntelVmExitHandler(
             Cpu->ProcessorIndex, 9, guestRip);
     }
     IntelFlushEptIfNeeded(context);
+    (VOID)IntelRendezvousJoinActive(context);
+    rendezvousPolicy = IntelRendezvousClassifyAndConsume(
+        context, reason, (ULONG)Registers->Rcx);
+    if (rendezvousPolicy == INTEL_POLICY_MANDATORY ||
+        rendezvousPolicy == INTEL_POLICY_CONDITIONAL) {
+        (VOID)IntelRendezvousBegin(context);
+    }
 
     if (reason == VMX_EXIT_INIT_SIGNAL) {
 
@@ -1120,13 +1136,9 @@ IntelVmExitHandler(
     }
 
     if (reason == VMX_EXIT_RDTSC || reason == VMX_EXIT_RDTSCP) {
-        ULONG64 tscOffset;
+        ULONG64 tscOffset = context->TscOffset;
         ULONG64 tsc;
 
-        if (!IntelVmReadValue(VMCS_TSC_OFFSET, &tscOffset)) {
-            KeBugCheckEx(HYPERVISOR_ERROR,
-                INTEL_BUGCHECK_UNEXPECTED_EXIT, reason, 13, guestRip);
-        }
         if (reason == VMX_EXIT_RDTSCP) {
             unsigned int aux;
             tsc = __rdtscp(&aux) + tscOffset;
@@ -1155,6 +1167,10 @@ IntelVmExitHandler(
                 (VMX_EVENT_VALID | VMX_EVENT_TYPE_NMI | 2u)) {
             ULONG64 interruptibility;
 
+            if (IntelRendezvousConsumeExpectedNmi(context)) {
+                return IntelCompleteVmExit(
+                    context, INTEL_VMEXIT_RESUME);
+            }
             if (!IntelVmReadValue(
                     VMCS_GUEST_INTERRUPTIBILITY, &interruptibility)) {
                 KeBugCheckEx(
@@ -1251,7 +1267,13 @@ IntelVmExitHandler(
         ULONG msr = (ULONG)Registers->Rcx;
         ULONG64 msrValue;
 
-        if (msr == IA32_FEATURE_CONTROL) {
+        if (msr == IA32_TIME_STAMP_COUNTER) {
+            msrValue = __rdtsc() + context->TscOffset;
+            Registers->Rax = (ULONG)msrValue;
+            Registers->Rdx = (ULONG)(msrValue >> 32);
+            IntelAdvanceGuestRip(
+                context, Cpu, reason, guestRip, instructionLength);
+        } else if (msr == IA32_FEATURE_CONTROL) {
             msrValue = __readmsr(msr);
             msrValue &= ~(IA32_FEATURE_CONTROL_VMX_IN_SMX |
                           IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX);
@@ -1322,6 +1344,7 @@ IntelVmExitHandler(
                 (INTEL_BACKEND_CONTEXT*)context->BackendContext;
 
             if (IntelHookLookup(backend, guestPhysical, &policy)) {
+                IntelRendezvousReloadHookBudget(context);
                 const INTEL_CPU_EPT_VIEW* target = NULL;
 
                 if (backend != NULL && backend->HookRoot != NULL) {
