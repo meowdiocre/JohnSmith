@@ -263,9 +263,9 @@ IntelSetupVmcs(
     if ((primaryControls & requiredPrimary) != requiredPrimary) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_PRIMARY_REQUIRED;
     }
-    if (((ULONG)(primaryCapability >> 32) &
-         INTEL_POLICY_REQUIRED_DYNAMIC_PRIMARY_CONTROLS) !=
-        INTEL_POLICY_REQUIRED_DYNAMIC_PRIMARY_CONTROLS) {
+    if (!IntelVmxControlsAreToggleable(
+            primaryCapability,
+            INTEL_POLICY_REQUIRED_DYNAMIC_PRIMARY_CONTROLS)) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_NMI_WINDOW;
     }
     if ((primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0) {

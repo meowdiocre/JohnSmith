@@ -22,6 +22,16 @@
 #define INTEL_POLICY_EXIT_RDTSCP             51u
 #define INTEL_POLICY_EXIT_PREEMPTION_TIMER   52u
 
+static inline int
+IntelVmxControlsAreToggleable(
+    unsigned long long capability,
+    unsigned mask
+    )
+{
+    return ((unsigned)capability & mask) == 0 &&
+           ((unsigned)(capability >> 32) & mask) == mask;
+}
+
 typedef enum {
     INTEL_POLICY_NONE = 0,
     INTEL_POLICY_MANDATORY,
