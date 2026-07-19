@@ -488,12 +488,7 @@ IntelRendezvousJoinActive(
             return joined;
         }
         if (phase == INTEL_RENDEZVOUS_CLAIMED) {
-            if (InterlockedCompareExchange(
-                    &Context->RendezvousJoinGuard, 0, 0) != 0) {
-                return TRUE;
-            }
-            _mm_pause();
-            continue;
+            return joined;
         }
         phaseBeforeGuard = phase;
         if (InterlockedCompareExchange(
@@ -507,8 +502,11 @@ IntelRendezvousJoinActive(
             result = joined;
             goto ReleaseGuard;
         }
-        if (phase == INTEL_RENDEZVOUS_CLAIMED ||
-            phase != phaseBeforeGuard ||
+        if (phase == INTEL_RENDEZVOUS_CLAIMED) {
+            result = joined;
+            goto ReleaseGuard;
+        }
+        if (phase != phaseBeforeGuard ||
             !IntelRendezvousSnapshotMatches(backend, phase, epoch)) {
             retry = TRUE;
             goto ReleaseGuard;
