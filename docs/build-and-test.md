@@ -91,6 +91,21 @@ the handler.
 AMD compilation on an Intel system is not AMD runtime proof. Keep that boundary
 explicit in reviews and release notes.
 
+## Intel rendezvous policy self-check
+
+Run the portable policy check from the repository root:
+
+```powershell
+cl /nologo /std:c17 /W4 /WX /TC /I .\src\intel `
+  .\tools\intel-rendezvous-policy-selfcheck.c `
+  /Fe:"$env:TEMP\johnsmith-rendezvous-policy-selfcheck.exe"
+& "$env:TEMP\johnsmith-rendezvous-policy-selfcheck.exe"
+```
+
+It covers policy, exact budget behavior, exclusions, ICR encoding, and
+mandatory control masks. The hardware-only boundary is LAPIC delivery, NMI
+callback timing, VMCS writes, timeout release, and resume skew.
+
 ## Pull-request checklist
 
 - [ ] Debug, Release, and Benchmark build without warnings.

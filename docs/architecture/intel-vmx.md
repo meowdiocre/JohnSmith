@@ -35,6 +35,31 @@ The VM-exit path:
 
 Unknown exits and invalid transition states use distinct fail-stop signatures.
 
+## NMI rendezvous and TSC compensation
+
+Timing-sensitive exits use an epoch-counted VMX-root barrier. The owner sends
+ICR-low `0x000C4400` through xAPIC MMIO offset `0x300` or x2APIC MSR `0x830`.
+NMI exiting handles targets in VMX non-root mode; a registered Windows NMI
+callback handles targets already in VMX-root mode.
+
+CPUID, EPT violations, intercepted RDTSC/RDTSCP, and intercepted
+`RDMSR(0x10)` are mandatory rendezvous exits. Control-register, other MSR,
+GDTR/IDTR, and LDTR/TR exits are conditional during the eight-exit hook
+window. External interrupts, MTF, and the VMX-preemption timer never start a
+rendezvous.
+
+Every participant prepares before any `VMCS_TSC_OFFSET` write. All processors
+apply one common compensation delta and wait for one future resume TSC.
+Acquisition and prepared-count timeouts fail open without compensation;
+failures after offset application begins fail stop.
+
+While the phase is `Claimed`, the owner drains old per-CPU join guards and, for
+xAPIC, verifies ICR readiness before resetting the epoch and counters. It then
+publishes `Acquiring`, arms new expected-epoch markers, and broadcasts. After
+a real broadcast, an outstanding marker intentionally consumes the first later
+NMI because delivery has no software epoch tag. The xAPIC preflight occurs
+before marker arming, preventing a no-send failure from leaving stale markers.
+
 ## CPUID policy
 
 CPUID exits are emulated. The policy hides VMX exposure, applies the enabled

@@ -38,27 +38,37 @@ instructions exit. The rendezvous policy applies if those exits occur.
 ### NMI delivery has no software tag
 
 An NMI broadcast cannot carry a private vector or source identifier. During an
-armed epoch, the first NMI exit observed by a non-owner processor that has not
-joined that epoch is treated as the rendezvous NMI and is not injected into the
-guest. Any unrelated physical NMI arriving in the same interval may coalesce
-with the rendezvous NMI. This is an architectural limitation of using NMIs as
+epoch, the owner publishes an expected epoch to each target before broadcast.
+The first NMI on that CPU consumes the marker even if delivery occurs after the
+CPU joined through another exit or the root-mode callback. An outstanding
+marker from a real broadcast therefore intentionally consumes the first later
+NMI. Any unrelated physical NMI may satisfy or coalesce with the marker. This
+approved first-NMI assumption is an architectural limitation of using NMIs as
 the forced-exit mechanism.
 
-NMIs received outside an armed epoch retain the existing virtual-NMI
-reinjection behavior.
+After changing the phase to `Claimed`, the owner first drains per-CPU join
+guards left by the prior epoch. In xAPIC mode it also waits for ICR delivery
+status to become idle while still `Claimed`. It then resets the epoch and
+counters, makes `Acquiring` visible, publishes the new expected epoch to each
+target, and broadcasts. An xAPIC readiness timeout aborts before marker arming
+and before the ICR write, so a no-send failure cannot leave stale expected
+markers. NMIs without an outstanding expected marker retain the existing
+virtual-NMI reinjection behavior.
 
 ### A processor may already be in VMX-root mode
 
 NMI exiting only forces processors that are in VMX non-root mode to exit.
 When a target is already executing root-mode code, the host IDT processes the
 NMI. The backend registers a nonpageable `KeRegisterNmiCallback` callback that
-joins an armed epoch using only per-CPU lookup, interlocked operations,
-`VMWRITE`, and `_mm_pause()`. It reports the internal rendezvous NMI as handled.
-Every fast and slow path also checks the active epoch immediately before
-`VMRESUME` as a defensive fallback for a coalesced or late observation.
+consumes the expected marker and joins an active epoch when needed, using only
+per-CPU lookup, interlocked operations, `VMWRITE`, and `_mm_pause()`. It reports
+the internal rendezvous NMI as handled. Every fast and slow path also checks
+the active epoch immediately before `VMRESUME` as a defensive fallback for a
+coalesced or late observation.
 
 The owner waits for an exact participant count with a bounded deadline. It
-never assumes that ICR delivery alone means the targets are frozen.
+never assumes that ICR readiness or the ICR write proves hardware completion
+or means the targets are frozen.
 
 ### Safe TSC compensation starts after complete arrival
 
@@ -128,13 +138,16 @@ For xAPIC, the owner waits for ICR delivery-status bit 12 to clear and writes
 `0x000C4400` to the mapped ICR-low register at offset `0x300`. The destination
 register is ignored because destination shorthand is active.
 
+The xAPIC readiness wait occurs while the phase is `Claimed`, before target
+markers are armed. A readiness timeout aborts without an ICR write.
+
 For x2APIC, the owner writes the 64-bit value `0x00000000000C4400` to
 `IA32_X2APIC_ICR` (`0x830`). The destination field is zero because shorthand
 selects all other logical processors.
 
-A full memory barrier publishes the epoch, owner, counts, and phase before the
-ICR write. Arrival counting, rather than delivery-status polling, proves that
-the topology has entered the barrier.
+The owner publishes the epoch, owner, counts, `Acquiring` phase, and target
+expected-epoch markers before the ICR write. Arrival counting, rather than
+delivery-status polling, proves that the topology has entered the barrier.
 
 ## VMCS controls
 
@@ -209,13 +222,17 @@ them to one of these classes.
 
 1. The triggering processor first joins any already-active epoch.
 2. It atomically changes the shared phase from `Idle` to `Claimed`.
-3. It increments the epoch and publishes its processor index and metadata.
-4. It snapshots processors whose state is `HV_CPU_RUNNING`. The participant
+3. While `Claimed`, it waits for all prior per-CPU join guards to drain and, in
+   xAPIC mode, verifies that the ICR is ready.
+4. It increments the epoch and publishes its processor index and metadata.
+5. It snapshots processors whose state is `HV_CPU_RUNNING`. The participant
    count includes the owner; arrived count starts at one.
-5. It release-publishes `Acquiring`, then broadcasts the NMI.
-6. It spins with `_mm_pause()` until arrived count equals participant count.
-7. It records the fully-frozen start TSC and changes phase to `Frozen`.
-8. It performs the exit-specific emulation or EPT operation.
+6. It resets the counters, release-publishes `Acquiring`, and publishes the
+   expected epoch to every target.
+7. It broadcasts the NMI.
+8. It spins with `_mm_pause()` until arrived count equals participant count.
+9. It records the fully-frozen start TSC and changes phase to `Frozen`.
+10. It performs the exit-specific emulation or EPT operation.
 
 Only one owner exists per epoch. A target increments arrived count once by
 atomically claiming its per-CPU joined epoch.
@@ -292,8 +309,11 @@ offsets would corrupt guest time.
 All phase transitions use interlocked operations or explicit barriers:
 
 - `Claimed` excludes another owner while metadata is constructed;
-- owner metadata is released before `Acquiring` becomes observable and before
-  the ICR write;
+- prior per-CPU join guards drain while `Claimed`, before epoch and counter
+  reset;
+- owner metadata is released before `Acquiring` becomes observable;
+- target expected-epoch markers are armed after `Acquiring` is visible and
+  before the ICR write;
 - targets acquire phase before reading epoch metadata;
 - compensation delta is released before `Preparing`;
 - all prepared increments complete before `Applying`;
@@ -331,14 +351,12 @@ Build-time verification covers:
 - WDK static analysis;
 - project XML parsing and `git diff --check`.
 
-A small runnable state-machine check will exercise:
+The portable self-check in `tools/intel-rendezvous-policy-selfcheck.c` covers:
 
 - mandatory, conditional, and excluded classification;
 - exact eight-exit budget consumption;
-- one-arrival, one-prepared, and one-applied increment per CPU per epoch;
-- concurrent-owner serialization;
-- acquisition abort without TSC modification;
-- identical compensation delta on all participants.
+- ICR-low encoding;
+- mandatory VMCS control masks.
 
 Bare-metal verification must record the processor model, APIC mode, active
 logical-processor count, build hash, and configuration. It must cover:
