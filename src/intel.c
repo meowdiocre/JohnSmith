@@ -145,7 +145,7 @@ IntelPrepare(
     NTSTATUS status;
 
     context = (INTEL_BACKEND_CONTEXT*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(*context), HV_POOL_TAG_BACKEND);
+        POOL_FLAG_NON_PAGED | POOL_FLAG_CACHE_ALIGNED, sizeof(*context), HV_POOL_TAG_BACKEND);
     if (context == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
