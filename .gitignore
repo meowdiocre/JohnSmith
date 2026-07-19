@@ -35,6 +35,7 @@ obj*/
 .agents/
 .codex/
 .codegraph/
+.worktrees/
 drv64.dll
 static/docs/hyprdbg.2207.05676v2.pdf
 
