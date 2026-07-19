@@ -64,5 +64,8 @@ main(void)
     assert(IntelRendezvousConsumeBudget(
         INTEL_POLICY_EXIT_PREEMPTION_TIMER, 8) == 8);
     assert(IntelRendezvousReloadBudget() == 8);
+    assert((INTEL_POLICY_REQUIRED_PIN_CONTROLS & (1u << 3)) != 0);
+    assert((INTEL_POLICY_REQUIRED_PIN_CONTROLS & (1u << 5)) != 0);
+    assert((INTEL_POLICY_REQUIRED_PRIMARY_CONTROLS & (1u << 3)) != 0);
     return 0;
 }

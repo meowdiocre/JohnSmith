@@ -183,6 +183,13 @@
 #define VMX_ENTRY_IA32E_MODE                (1u << 9)
 #define VMX_ENTRY_LOAD_PAT                  (1u << 14)
 #define VMX_ENTRY_LOAD_EFER                 (1u << 15)
+
+C_ASSERT(INTEL_POLICY_REQUIRED_PIN_CONTROLS ==
+         (VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS));
+C_ASSERT(INTEL_POLICY_REQUIRED_PRIMARY_CONTROLS ==
+         (VMX_PRIMARY_ACTIVATE_SECONDARY |
+          VMX_PRIMARY_USE_MSR_BITMAPS |
+          VMX_PRIMARY_USE_TSC_OFFSETTING));
 #define VMX_CR4_VMXE                        (1ull << 13)
 #define CPUID_CET_SS                        (1u << 7)
 #define CPUID_CET_IBT                       (1u << 20)
@@ -276,11 +283,13 @@
 #define INTEL_START_STAGE_INVVPID           8u
 #define INTEL_START_STAGE_VMLAUNCH          9u
 
-#define INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION (1u << 3)
-#define INTEL_CONTROL_FAIL_BITMAPS              (1u << 4)
-#define INTEL_CONTROL_FAIL_SECONDARY_REQUIRED   (1u << 5)
-#define INTEL_CONTROL_FAIL_EXIT_REQUIRED        (1u << 6)
-#define INTEL_CONTROL_FAIL_ENTRY_REQUIRED       (1u << 7)
+#define INTEL_CONTROL_FAIL_PIN_REQUIRED          (1u << 0)
+#define INTEL_CONTROL_FAIL_PRIMARY_REQUIRED      (1u << 1)
+#define INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION  (1u << 3)
+#define INTEL_CONTROL_FAIL_BITMAPS               (1u << 4)
+#define INTEL_CONTROL_FAIL_SECONDARY_REQUIRED    (1u << 5)
+#define INTEL_CONTROL_FAIL_EXIT_REQUIRED         (1u << 6)
+#define INTEL_CONTROL_FAIL_ENTRY_REQUIRED        (1u << 7)
 
 typedef enum _INTEL_SPLIT_REASON {
     /* Boot-time split because the covered 2 MiB region mixes RAM and MMIO.

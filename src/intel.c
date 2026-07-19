@@ -352,16 +352,19 @@ IntelReportStartFailure(
     if (context->StartFailureStage == INTEL_START_STAGE_VMCS_SETUP &&
         context->ControlFailureMask != 0) {
         HV_LOG_ERROR(
-            "CPU %lu VMCS control mismatch 0x%02X: pin=0x%08X, "
-            "primary=0x%08X/desired=0x%08X, "
+            "CPU %lu VMCS control mismatch 0x%02X: "
+            "pin=0x%08X/required=0x%08X, "
+            "primary=0x%08X/desired=0x%08X/required=0x%08X, "
             "secondary=0x%08X/desired=0x%08X/required=0x%08X, "
             "exit=0x%08X/required=0x%08X, "
             "entry=0x%08X/required=0x%08X.\n",
             Cpu->ProcessorIndex,
             context->ControlFailureMask,
             context->PinControls,
+            context->RequiredPinControls,
             context->PrimaryControls,
             context->DesiredPrimaryControls,
+            context->RequiredPrimaryControls,
             context->SecondaryControls,
             context->DesiredSecondaryControls,
             context->RequiredSecondaryControls,

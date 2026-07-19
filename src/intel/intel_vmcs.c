@@ -109,8 +109,10 @@ IntelSetupVmcs(
     ULONG entryControls;
     ULONG desiredSecondary;
     ULONG desiredPin;
+    ULONG requiredPin;
     ULONG requiredSecondary;
     ULONG desiredPrimary;
+    ULONG requiredPrimary;
     ULONG requiredExit;
     ULONG requiredEntry;
     ULONG maxBasicLeaf;
@@ -152,7 +154,8 @@ IntelSetupVmcs(
     entryMsr = (backend->VmxBasic & (1ull << 55)) != 0
         ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS;
 
-    desiredPin = 0;
+    requiredPin = VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS;
+    desiredPin = requiredPin;
     desiredSecondary = VMX_SECONDARY_ENABLE_EPT;
     requiredSecondary = VMX_SECONDARY_ENABLE_EPT;
     __cpuid(cpuid, 0x80000000);
@@ -212,8 +215,10 @@ IntelSetupVmcs(
         desiredSecondary |= VMX_SECONDARY_ENABLE_VPID;
     }
 
-    desiredPrimary = VMX_PRIMARY_ACTIVATE_SECONDARY |
-                     VMX_PRIMARY_USE_MSR_BITMAPS;
+    requiredPrimary = VMX_PRIMARY_ACTIVATE_SECONDARY |
+                      VMX_PRIMARY_USE_MSR_BITMAPS |
+                      VMX_PRIMARY_USE_TSC_OFFSETTING;
+    desiredPrimary = requiredPrimary;
     pinControls = IntelAdjustControls(desiredPin, pinMsr);
     primaryControls = IntelAdjustControls(
         desiredPrimary, primaryMsr);
@@ -235,6 +240,8 @@ IntelSetupVmcs(
     context->EntryControls = entryControls;
     context->DesiredPrimaryControls = desiredPrimary;
     context->DesiredSecondaryControls = desiredSecondary;
+    context->RequiredPinControls = requiredPin;
+    context->RequiredPrimaryControls = requiredPrimary;
     context->VirtualNmiEnabled =
         (pinControls & (VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS)) ==
         (VMX_PIN_NMI_EXITING | VMX_PIN_VIRTUAL_NMIS);
@@ -248,6 +255,12 @@ IntelSetupVmcs(
     context->CpuidClearLeaf80000001Edx = (secondaryControls &
         VMX_SECONDARY_ENABLE_RDTSCP) ? 0 : (1u << 27);
     context->ControlFailureMask = 0;
+    if ((pinControls & requiredPin) != requiredPin) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_PIN_REQUIRED;
+    }
+    if ((primaryControls & requiredPrimary) != requiredPrimary) {
+        context->ControlFailureMask |= INTEL_CONTROL_FAIL_PRIMARY_REQUIRED;
+    }
     if ((primaryControls & VMX_PRIMARY_ACTIVATE_SECONDARY) == 0) {
         context->ControlFailureMask |= INTEL_CONTROL_FAIL_SECONDARY_ACTIVATION;
     }
@@ -282,6 +295,7 @@ IntelSetupVmcs(
     hostFrame->Cpu = Cpu;
     hostFrame->CpuSlatGeneration = &context->SlatGeneration;
     hostFrame->BackendSlatGeneration = &backend->SlatGeneration;
+    hostFrame->RendezvousPhase = &backend->Rendezvous.Phase;
     hostFrame->CpuidLeaf0Eax = context->CpuidLeaf0Eax;
     hostFrame->CpuidLeaf0Ebx = context->CpuidLeaf0Ebx;
     hostFrame->CpuidLeaf0Ecx = context->CpuidLeaf0Ecx;
@@ -309,6 +323,7 @@ IntelSetupVmcs(
     VMX_WRITE(VMCS_ENTRY_INSTRUCTION_LENGTH, 0);
     VMX_WRITE(VMCS_TPR_THRESHOLD, 0);
     VMX_WRITE(VMCS_MSR_BITMAP, context->MsrBitmapPhysical.QuadPart);
+    VMX_WRITE(VMCS_TSC_OFFSET, context->TscOffset);
     VMX_WRITE(VMCS_EPT_POINTER, eptp);
     VMX_WRITE(VMCS_VPID, context->Vpid);
     if ((secondaryControls & VMX_SECONDARY_ENABLE_XSAVES) != 0) {

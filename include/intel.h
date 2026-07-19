@@ -130,6 +130,8 @@ typedef struct _INTEL_CPU_CONTEXT {
     ULONG EntryControls;
     ULONG DesiredPrimaryControls;
     ULONG DesiredSecondaryControls;
+    ULONG RequiredPinControls;
+    ULONG RequiredPrimaryControls;
     ULONG RequiredSecondaryControls;
     ULONG RequiredExitControls;
     ULONG RequiredEntryControls;
