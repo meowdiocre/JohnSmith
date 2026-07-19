@@ -165,12 +165,16 @@ IntelPrepare(
 
     State->BackendContext = context;
 
-    status = IntelBuildEpt(context);
+    status = IntelRendezvousPrepare(context, State);
+    if (NT_SUCCESS(status)) {
+        status = IntelBuildEpt(context);
+    }
     if (NT_SUCCESS(status)) {
         status = IntelHookEnsureSecondaryRoot(context);
     }
     if (!NT_SUCCESS(status)) {
         IntelFreeEpt(context);
+        IntelRendezvousFree(context);
         ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
         State->BackendContext = NULL;
     }
@@ -191,6 +195,7 @@ IntelFree(
     IntelHookTeardown();
     ObserveHookReset();
     IntelFreeEpt(context);
+    IntelRendezvousFree(context);
     ExFreePoolWithTag(context, HV_POOL_TAG_BACKEND);
     State->BackendContext = NULL;
 }
@@ -243,6 +248,9 @@ IntelPrepareCpu(
     }
     RtlZeroMemory(context, sizeof(*context));
     ExInitializeRundownProtection(&context->HypercallPageRundown);
+    context->BackendContext = backend;
+    context->ProcessorIndex = Cpu->ProcessorIndex;
+    context->TscOffset = 0;
 
     context->Vmxon = IntelAllocatePage(MAXULONG);
     context->Vmcs = IntelAllocatePage(MAXULONG);
@@ -258,7 +266,6 @@ IntelPrepareCpu(
     context->VmxonPhysical = MmGetPhysicalAddress(context->Vmxon);
     context->VmcsPhysical = MmGetPhysicalAddress(context->Vmcs);
     context->MsrBitmapPhysical = MmGetPhysicalAddress(context->MsrBitmap);
-    context->BackendContext = backend;
     context->SlatGeneration = backend->SlatGeneration;
     context->StopCookie = __rdtsc() ^ (ULONG64)context ^
                           (ULONG64)context->VmcsPhysical.QuadPart;
