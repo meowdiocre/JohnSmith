@@ -12,15 +12,31 @@ main(void)
     assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_CPUID, 0, 0) == INTEL_POLICY_MANDATORY);
     assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_RDTSC, 0, 0) == INTEL_POLICY_MANDATORY);
+    assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_EPT_VIOLATION, 0, 0) ==
         INTEL_POLICY_MANDATORY);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_RDTSCP, 0, 0) == INTEL_POLICY_MANDATORY);
     assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_RDMSR, INTEL_POLICY_IA32_TSC, 0) ==
         INTEL_POLICY_MANDATORY);
     assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_RDMSR, 0, 1) == INTEL_POLICY_CONDITIONAL);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_RDMSR, 0, 0) == INTEL_POLICY_NONE);
+    assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_CR_ACCESS, 0, 1) == INTEL_POLICY_CONDITIONAL);
     assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_CR_ACCESS, 0, 0) == INTEL_POLICY_NONE);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_WRMSR, 0, 1) == INTEL_POLICY_CONDITIONAL);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_WRMSR, 0, 0) == INTEL_POLICY_NONE);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_GDTR_IDTR, 0, 1) == INTEL_POLICY_CONDITIONAL);
+    assert(IntelRendezvousClassifyPolicy(
+        INTEL_POLICY_EXIT_LDTR_TR, 0, 1) == INTEL_POLICY_CONDITIONAL);
     assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_EXTERNAL_INTERRUPT, 0, 8) ==
         INTEL_POLICY_EXCLUDED);
@@ -29,13 +45,18 @@ main(void)
     assert(IntelRendezvousClassifyPolicy(
         INTEL_POLICY_EXIT_PREEMPTION_TIMER, 0, 8) ==
         INTEL_POLICY_EXCLUDED);
+    assert(IntelRendezvousClassifyPolicy(
+        0xFFFFFFFFu, 0, 8) == INTEL_POLICY_NONE);
 
     budget = INTEL_RENDEZVOUS_HOOK_BUDGET;
     for (index = 0; index < INTEL_RENDEZVOUS_HOOK_BUDGET; ++index) {
         budget = IntelRendezvousConsumeBudget(
             INTEL_POLICY_EXIT_CPUID, budget);
+        assert(budget == INTEL_RENDEZVOUS_HOOK_BUDGET - index - 1);
     }
     assert(budget == 0);
+    assert(IntelRendezvousConsumeBudget(
+        INTEL_POLICY_EXIT_CPUID, budget) == 0);
     assert(IntelRendezvousConsumeBudget(
         INTEL_POLICY_EXIT_EXTERNAL_INTERRUPT, 8) == 8);
     assert(IntelRendezvousConsumeBudget(
