@@ -502,19 +502,21 @@ IntelStop(
     INTEL_CPU_CONTEXT* context;
     INTEL_DESCRIPTOR_TABLE_REGISTER gdtr;
     INTEL_DESCRIPTOR_TABLE_REGISTER idtr;
+    LONG64 ownedEpoch;
 
     UNREFERENCED_PARAMETER(State);
     if (!IntelCurrentCpuMatches(Cpu) || Cpu->VendorContext == NULL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
     context = (INTEL_CPU_CONTEXT*)Cpu->VendorContext;
-    if (InterlockedCompareExchange64(
-            &context->RendezvousOwnedEpoch, 0, 0) != 0) {
+    ownedEpoch = InterlockedCompareExchange64(
+        &context->RendezvousOwnedEpoch, 0, 0);
+    if (ownedEpoch != 0) {
         KeBugCheckEx(
             HYPERVISOR_ERROR,
             INTEL_BUGCHECK_RENDEZVOUS,
             Cpu->ProcessorIndex,
-            context->RendezvousOwnedEpoch,
+            ownedEpoch,
             INTEL_VMEXIT_STOP);
     }
     if (!context->Launched) {
