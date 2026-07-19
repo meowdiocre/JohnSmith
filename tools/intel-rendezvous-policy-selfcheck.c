@@ -38,6 +38,10 @@ main(void)
     assert(budget == 0);
     assert(IntelRendezvousConsumeBudget(
         INTEL_POLICY_EXIT_EXTERNAL_INTERRUPT, 8) == 8);
+    assert(IntelRendezvousConsumeBudget(
+        INTEL_POLICY_EXIT_MTF, 8) == 8);
+    assert(IntelRendezvousConsumeBudget(
+        INTEL_POLICY_EXIT_PREEMPTION_TIMER, 8) == 8);
     assert(IntelRendezvousReloadBudget() == 8);
     return 0;
 }
