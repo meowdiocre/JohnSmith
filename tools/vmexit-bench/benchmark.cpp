@@ -158,6 +158,24 @@ static bool RunProbe(
     return true;
 }
 
+static std::int64_t AverageAdjustedTiming(
+    const std::uint64_t cpuidTotal,
+    const std::uint64_t rdtscTotal,
+    const unsigned iterations)
+{
+    if (iterations == 0) return 0;
+    const auto divisor = static_cast<std::uint64_t>(iterations);
+    return static_cast<std::int64_t>(cpuidTotal / divisor) -
+           static_cast<std::int64_t>(rdtscTotal / divisor);
+}
+
+static bool TimingSelfCheck()
+{
+    return AverageAdjustedTiming(1000, 200, 100) == 8 &&
+           AverageAdjustedTiming(200, 1000, 100) == -8 &&
+           AverageAdjustedTiming(0, 0, 0) == 0;
+}
+
 static unsigned ParseSamples(const int argc, char** argv)
 {
     if (argc < 2) return 200000;
@@ -169,6 +187,15 @@ static unsigned ParseSamples(const int argc, char** argv)
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--selfcheck") == 0) {
+        if (!TimingSelfCheck()) {
+            std::fputs("hv-benchmark selfcheck failed\n", stderr);
+            return 1;
+        }
+        std::puts("hv-benchmark selfcheck passed");
+        return 0;
+    }
+
     const unsigned sampleCount = ParseSamples(argc, argv);
     const bool requestVmcall = argc >= 3 && std::strcmp(argv[2], "--vmcall") == 0;
     const auto cores = FirstLogicalCpuPerCore();
