@@ -244,7 +244,7 @@ IntelRendezvousFree(
             (ULONG_PTR)Backend->Rendezvous.Epoch);
     }
     if (Backend->NmiCallbackHandle != NULL) {
-        if (!KeDeregisterNmiCallback(Backend->NmiCallbackHandle)) {
+        if (!NT_SUCCESS(KeDeregisterNmiCallback(Backend->NmiCallbackHandle))) {
             KeBugCheckEx(
                 HYPERVISOR_ERROR,
                 INTEL_BUGCHECK_RENDEZVOUS,
