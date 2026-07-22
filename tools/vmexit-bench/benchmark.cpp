@@ -43,6 +43,12 @@ struct Statistics {
     std::uint64_t p90;
 };
 
+struct CpuidRdtscTiming {
+    std::uint64_t cpuidAverage;
+    std::uint64_t rdtscAverage;
+    std::int64_t adjustedAverage;
+};
+
 using Probe = void (*)(volatile std::uint64_t*, std::uint64_t*, unsigned);
 
 static __declspec(noinline) bool InvokeProbeSeh(
@@ -169,6 +175,41 @@ static std::int64_t AverageAdjustedTiming(
            static_cast<std::int64_t>(rdtscTotal / divisor);
 }
 
+static __declspec(noinline) CpuidRdtscTiming MeasureCpuidRdtscTiming()
+{
+    constexpr unsigned iterationCount = 100;
+    std::uint64_t cpuidTotal = 0;
+    std::uint64_t rdtscTotal = 0;
+    int registers[4]{};
+    volatile int cpuidResult[4]{};
+
+    for (unsigned index = 0; index < iterationCount; ++index) {
+        const std::uint64_t before = __rdtsc();
+        __cpuid(registers, 1);
+        cpuidResult[0] = registers[0];
+        cpuidResult[1] = registers[1];
+        cpuidResult[2] = registers[2];
+        cpuidResult[3] = registers[3];
+        const std::uint64_t after = __rdtsc();
+        cpuidTotal += after - before;
+    }
+
+    for (unsigned index = 0; index < iterationCount; ++index) {
+        const std::uint64_t before = __rdtsc();
+        const std::uint64_t after = __rdtsc();
+        rdtscTotal += after - before;
+    }
+
+    const auto divisor = static_cast<std::uint64_t>(iterationCount);
+    const CpuidRdtscTiming result{
+        cpuidTotal / divisor,
+        rdtscTotal / divisor,
+        AverageAdjustedTiming(cpuidTotal, rdtscTotal, iterationCount)
+    };
+    static_cast<void>(cpuidResult[0]);
+    return result;
+}
+
 static bool TimingSelfCheck()
 {
     return AverageAdjustedTiming(1000, 200, 100) == 8 &&
@@ -256,6 +297,7 @@ int main(int argc, char** argv)
         return 4;
     }
     Sleep(50);
+    const CpuidRdtscTiming cpuidRdtsc = MeasureCpuidRdtscTiming();
 
     std::printf(
         "samples=%u test=group%u/cpu%u clock=group%u/cpu%u max_leaf=0x%X\n",
@@ -265,6 +307,12 @@ int main(int argc, char** argv)
         clockCpu.group,
         clockCpu.number,
         maximumLeaf);
+    std::printf(
+        "cpuid-rdtsc leaf=1 iterations=100 cpuid_avg=%llu "
+        "rdtsc_avg=%llu adjusted=%lld\n",
+        static_cast<unsigned long long>(cpuidRdtsc.cpuidAverage),
+        static_cast<unsigned long long>(cpuidRdtsc.rdtscAverage),
+        static_cast<long long>(cpuidRdtsc.adjustedAverage));
     std::fflush(stdout);
 
     Statistics serialize{};
