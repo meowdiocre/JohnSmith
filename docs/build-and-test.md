@@ -60,7 +60,7 @@ invalidates code-to-log conclusions.
 ## VM-exit benchmark
 
 ```powershell
-.\build\bin\tools\vmexit-bench.exe 200000
+.\build\bin\tools\hv-benchmark.exe 200000
 ```
 
 For the Intel CPUID rendezvous gate, use one Release artifact set on one
@@ -79,8 +79,8 @@ inactive samples:
 ```powershell
 Copy-Item .\build\bin\Release\JohnSmith.sys .\build\bin\tools\JohnSmith.sys -Force
 Get-FileHash .\build\bin\tools\JohnSmith.sys -Algorithm SHA256
-Get-FileHash .\build\bin\tools\vmexit-bench.exe -Algorithm SHA256
-1..5 | ForEach-Object { .\build\bin\tools\vmexit-bench.exe 200000 }
+Get-FileHash .\build\bin\tools\hv-benchmark.exe -Algorithm SHA256
+1..5 | ForEach-Object { .\build\bin\tools\hv-benchmark.exe 200000 }
 ```
 
 Start JohnSmith without installing or probing hooks, then run five active
@@ -90,8 +90,8 @@ samples. Before those runs, record the loaded service path and both hashes:
 .\build\bin\tools\johnsmithctl.exe start --cpu 0
 sc.exe qc JohnSmith
 Get-FileHash .\build\bin\tools\JohnSmith.sys -Algorithm SHA256
-Get-FileHash .\build\bin\tools\vmexit-bench.exe -Algorithm SHA256
-1..5 | ForEach-Object { .\build\bin\tools\vmexit-bench.exe 200000 }
+Get-FileHash .\build\bin\tools\hv-benchmark.exe -Algorithm SHA256
+1..5 | ForEach-Object { .\build\bin\tools\hv-benchmark.exe 200000 }
 ```
 
 `BINARY_PATH_NAME` must resolve to `build\bin\tools\JohnSmith.sys`, and both
@@ -107,7 +107,7 @@ For the transition floor:
 ```powershell
 msbuild .\JohnSmith.sln /m /p:Configuration=Benchmark /p:Platform=x64
 .\build\bin\tools\johnsmithctl.exe start --cpu 0
-.\build\bin\tools\vmexit-bench.exe 200000 --vmcall
+.\build\bin\tools\hv-benchmark.exe 200000 --vmcall
 ```
 
 `0xC000001D` is expected on bare metal and with Debug/Release. If it occurs with

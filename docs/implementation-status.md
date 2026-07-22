@@ -19,7 +19,7 @@ Windows build.
 | Intel control transport | `src/intel/intel_hypercall.c` and `src/intel/intel_hypercall_worker.c` implement the seeded CPUID/shared-page protocol. |
 | AMD SVM/NPT | `src/amd.c`, `src/amd/`, `include/amd.h`, and `asm/amd.asm`. |
 | Control client and loader | `tools/johnsmithctl/` starts and stops the driver, resolves exports, accesses memory, and manages hooks. |
-| VM-exit measurement | `tools/vmexit-bench/` measures CPUID and Benchmark VMCALL transitions. |
+| Hypervisor measurement | `tools/hv-benchmark/` measures CPUID, RDTSC, SERIALIZE, and Benchmark VMCALL transitions. |
 
 ## Repository checks
 
