@@ -29,7 +29,10 @@ static bool Parse(const std::initializer_list<const char*> arguments, BenchmarkO
     return ParseOptions(static_cast<int>(argv.size()), argv.data(), options);
 }
 
-static std::string CapturePanel(const ModuleResult& result, const bool plain)
+static std::string CapturePanel(
+    const std::string& title,
+    const std::vector<PanelRow>& rows,
+    const bool plain)
 {
     FILE* capture = nullptr;
     assert(tmpfile_s(&capture) == 0);
@@ -38,7 +41,7 @@ static std::string CapturePanel(const ModuleResult& result, const bool plain)
     assert(saved >= 0);
     assert(_dup2(_fileno(capture), _fileno(stdout)) == 0);
 
-    PrintPanel(result, plain);
+    PrintPanel(title, rows, plain);
     std::fflush(stdout);
     assert(_dup2(saved, _fileno(stdout)) == 0);
     _close(saved);
@@ -73,6 +76,12 @@ int main()
     assert(Parse({"benchmark", "--all", "--plain", "--vmcall"}, options));
     assert(ModuleBits(options.modules) == ModuleBits(BenchmarkModule::All));
     assert(options.plain && options.vmcall);
+    assert(Parse({"benchmark", "--tsc-cpuid"}, options));
+    assert(ModuleBits(options.modules) == ModuleBits(BenchmarkModule::TscCpuid));
+    assert(!options.plain && !options.vmcall);
+    assert(Parse({"benchmark"}, options));
+    assert(ModuleBits(options.modules) == ModuleBits(BenchmarkModule::All));
+    assert(!options.plain && !options.vmcall);
     assert(Parse({"benchmark", "10000"}, options));
     assert(options.sampleCount == 10000);
     assert(Parse({"benchmark", "--plain", "10000000", "--vmcall"}, options));
@@ -93,26 +102,23 @@ int main()
     assert(!TscExitPasses(0));
     assert(!TscExitPasses(1000));
 
-    const SoftwareTickTripwire tripwire = DetectSoftwareTickTripwire({1, 1, 2001, 2});
+    const SoftwareTickTripwire tripwire = DetectSoftwareTickTripwire(1, 2001);
     assert(tripwire.equalOne);
     assert(tripwire.greaterThan2000);
-    const SoftwareTickTripwire clear = DetectSoftwareTickTripwire({2, 3, 2000});
+    const SoftwareTickTripwire clear = DetectSoftwareTickTripwire(2, 2000);
     assert(!clear.equalOne && !clear.greaterThan2000);
 
-    const ModuleOutcome failure{false, false, ERROR_SUCCESS};
     const ModuleOutcome setupFailure{false, true, ERROR_ACCESS_DENIED};
-    const ModuleOutcome combined = CombineOutcome(failure, setupFailure);
-    assert(!combined.passed);
-    assert(combined.setupError == ERROR_ACCESS_DENIED);
+    assert(CombineOutcome(0, setupFailure) == ERROR_ACCESS_DENIED);
+    assert(CombineOutcome(ERROR_FILE_NOT_FOUND, setupFailure) == ERROR_FILE_NOT_FOUND);
+    assert(CombineOutcome(1, setupFailure) == ERROR_ACCESS_DENIED);
     const ModuleOutcome gatedFailure{true, false, ERROR_SUCCESS};
     const ModuleOutcome nonSetupCode{false, true, 1};
-    const ModuleOutcome gatedCombined = CombineOutcome(gatedFailure, nonSetupCode);
-    assert(gatedCombined.gated);
-    assert(!gatedCombined.passed);
-    assert(gatedCombined.setupError == ERROR_SUCCESS);
-    const ModuleOutcome firstSetup{false, true, ERROR_FILE_NOT_FOUND};
-    const ModuleOutcome secondSetup{false, true, ERROR_ACCESS_DENIED};
-    assert(CombineOutcome(firstSetup, secondSetup).setupError == ERROR_FILE_NOT_FOUND);
+    assert(CombineOutcome(0, gatedFailure) == 1);
+    assert(CombineOutcome(1, nonSetupCode) == 1);
+    assert(CombineOutcome(0, nonSetupCode) == 0);
+    const ModuleOutcome nonGatedFailure{false, false, ERROR_SUCCESS};
+    assert(CombineOutcome(0, nonGatedFailure) == 0);
 
     assert(AverageAdjustedTiming(1000, 200, 100) == 8);
     assert(AverageAdjustedTiming(200, 1000, 100) == -8);
@@ -122,9 +128,9 @@ int main()
         "Timer",
         {{"short", "12345"}, {"long-name", "1"}},
         {false, true, ERROR_SUCCESS}};
-    assert(CapturePanel(panel, true) ==
+    assert(CapturePanel(panel.title, panel.rows, true) ==
            "Timer:\nshort | 12345\nlong-name | 1\n\n");
-    const std::string boxed = CapturePanel(panel, false);
+    const std::string boxed = CapturePanel(panel.title, panel.rows, false);
     assert(boxed.find("\xE2\x94\x8C") != std::string::npos);
     assert(boxed.find("\xE2\x94\x80") != std::string::npos);
     assert(boxed.find("\xE2\x94\x82") != std::string::npos);
@@ -138,6 +144,6 @@ int main()
            "┌─ Timer ───────────┐\n"
            "│ short     | 12345 │\n"
            "│ long-name | 1     │\n"
-           "└───────────────────┘\n");
+           "└───────────────────┘\n\n");
     return 0;
 }

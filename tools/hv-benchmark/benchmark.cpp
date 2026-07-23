@@ -31,7 +31,7 @@ struct PanelRow { std::string name; std::string value; };
 struct ModuleOutcome {
     bool gated;
     bool passed;
-    DWORD setupError;
+    int setupError;
 };
 
 struct ModuleResult {
@@ -90,48 +90,50 @@ struct SoftwareTickTripwire {
 [[maybe_unused]] static bool SoftwareTickPasses(const double ratio) { return ratio < 2.5; }
 [[maybe_unused]] static bool TscExitPasses(const double average) { return average > 0 && average < 1000; }
 
-[[maybe_unused]] static SoftwareTickTripwire DetectSoftwareTickTripwire(const std::vector<double>& values)
+[[maybe_unused]] static SoftwareTickTripwire DetectSoftwareTickTripwire(
+    const double serializeTrimmedMean,
+    const double leaf0TrimmedMean)
 {
-    SoftwareTickTripwire result{false, false};
-    for (const double value : values) {
-        result.equalOne = result.equalOne || value == 1.0;
-        result.greaterThan2000 = result.greaterThan2000 || value > 2000.0;
-    }
-    return result;
-}
-
-[[maybe_unused]] static ModuleOutcome CombineOutcome(const ModuleOutcome left, const ModuleOutcome right)
-{
-    const DWORD setupError = left.setupError >= 2 ? left.setupError :
-                             right.setupError >= 2 ? right.setupError : ERROR_SUCCESS;
     return {
-        left.gated || right.gated,
-        left.passed && right.passed && setupError == ERROR_SUCCESS,
-        setupError
+        serializeTrimmedMean == 1.0 || leaf0TrimmedMean == 1.0,
+        serializeTrimmedMean > 2000.0 || leaf0TrimmedMean > 2000.0
     };
 }
 
-[[maybe_unused]] static void PrintPanel(const ModuleResult& result, const bool plain)
+[[maybe_unused]] static int CombineOutcome(
+    const int currentExitCode,
+    const ModuleOutcome& outcome)
+{
+    if (currentExitCode >= 2) return currentExitCode;
+    if (outcome.setupError >= 2) return outcome.setupError;
+    if (currentExitCode == 1) return currentExitCode;
+    return outcome.gated && !outcome.passed ? 1 : 0;
+}
+
+[[maybe_unused]] static void PrintPanel(
+    const std::string& title,
+    const std::vector<PanelRow>& rows,
+    const bool plain)
 {
     if (plain) {
-        std::printf("%s:\n", result.title.c_str());
-        for (const PanelRow& row : result.rows)
+        std::printf("%s:\n", title.c_str());
+        for (const PanelRow& row : rows)
             std::printf("%s | %s\n", row.name.c_str(), row.value.c_str());
         std::putchar('\n');
         return;
     }
     std::size_t nameWidth = 0;
     std::size_t valueWidth = 0;
-    for (const PanelRow& row : result.rows) {
+    for (const PanelRow& row : rows) {
         nameWidth = (std::max)(nameWidth, row.name.size());
         valueWidth = (std::max)(valueWidth, row.value.size());
     }
     const std::size_t width = (std::max)(
-        result.title.size() + 3, nameWidth + valueWidth + 5);
-    std::printf("┌─ %s ", result.title.c_str());
-    for (std::size_t i = result.title.size() + 3; i < width; ++i) std::printf("─");
+        title.size() + 3, nameWidth + valueWidth + 5);
+    std::printf("┌─ %s ", title.c_str());
+    for (std::size_t i = title.size() + 3; i < width; ++i) std::printf("─");
     std::printf("┐\n");
-    for (const PanelRow& row : result.rows)
+    for (const PanelRow& row : rows)
     {
         std::printf("│ %s", row.name.c_str());
         for (std::size_t i = row.name.size(); i < nameWidth; ++i) std::putchar(' ');
@@ -142,7 +144,7 @@ struct SoftwareTickTripwire {
     }
     std::printf("└");
     for (std::size_t i = 0; i < width; ++i) std::printf("─");
-    std::printf("┘\n");
+    std::printf("┘\n\n");
 }
 
 extern "C" void MeasureSerialize(volatile std::uint64_t*, std::uint64_t*, unsigned);
